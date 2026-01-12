@@ -101,8 +101,7 @@
 ## ========================================
 
 ## Check if container feature is enabled
-:local dm [/system/device-mode print]
-:if ([:find $dm "container: yes"] != nil) do={
+:if ([:find [/system/device-mode print] "container: yes"] != nil) do={
     :log info "Container feature is ENABLED."
 } else={
     :log warning "Container feature is DISABLED. Enabling..."
