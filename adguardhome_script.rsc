@@ -110,6 +110,17 @@
     :error "Reboot required"
 }
 
+## Check if container feature is enabled
+:local containerEnabled false
+:if ([:find $em "container: yes"] != nil) do={
+    :log info "Container feature is ENABLED."
+} else={
+    :log warning "Container feature is DISABLED. Enabling..."
+    /system/device-mode update container=yes
+    :log warning "NOTE: Router will need to be rebooted after this change!"
+    :error "Reboot required"
+}
+
 :if ($containerEnabled != true) do={
     :put "Container feature is DISABLED. Enabling..."
     :put "NOTE: Router will need to be rebooted after this change!"
