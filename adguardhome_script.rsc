@@ -100,23 +100,15 @@
 ## First-time setup checks
 ## ========================================
 
-## Check if container feature is enabled
-:if ([:find [/system/device-mode print] "container: yes"] != nil) do={
-    :log info "Container feature is ENABLED."
-} else={
-    :log warning "Container feature is DISABLED. Enabling..."
-    /system/device-mode update container=yes
-    :log warning "NOTE: Router will need to be rebooted after this change!"
-    :error "Reboot required"
-}
-
-## Check if container feature is enabled
+## Check for container feature
+:local containerEnabled false
 :put "Checking if container feature is enabled..."
 :if ([:find [/system/device-mode print] "container: yes"] != nil) do={
     :log info "Container feature is ENABLED."
+    :set $containerEnabled true
 } else={
     :log warning "Container feature is DISABLED. Enabling..."
-    /system/device-mode update container=yes
+    #/system/device-mode update container=yes
     :log warning "NOTE: Router will need to be rebooted after this change!"
     :error "Reboot required"
 }
