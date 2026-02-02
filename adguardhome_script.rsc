@@ -106,7 +106,12 @@
 :local containerEnabled false
 :if ([:len $deviceMode] > 0) do={
     :foreach k,v in=($deviceMode->0) do={
-        :if ($k = "container") do={ :set containerEnabled $v }
+        :if ($k = "container") do={ 
+            ## Handle both boolean and string representations
+            :if ($v = true || $v = "true" || $v = "yes") do={
+                :set containerEnabled true
+            }
+        }
     }
 }
 
