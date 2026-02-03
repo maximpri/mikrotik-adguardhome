@@ -102,17 +102,17 @@
 
 ## Check if container feature is enabled
 :put "Checking if container feature is enabled..."
-:local deviceMode [/system/device-mode/print as-value]
 :local containerEnabled false
-:if ([:len $deviceMode] > 0) do={
-    :foreach k,v in=($deviceMode->0) do={
-        :if ($k = "container") do={ 
-            ## Handle both boolean and string representations
-            :if ($v = true || $v = "true" || $v = "yes") do={
-                :set containerEnabled true
-            }
-        }
-    }
+
+## Try to get container status directly using find
+:local containerStatus [/system device-mode get container]
+:put "DEBUG: container status from get: $containerStatus"
+
+:if ($containerStatus = "yes" || $containerStatus = true || $containerStatus = "true") do={
+    :set containerEnabled true
+    :put "DEBUG: Container is ENABLED"
+} else={
+    :put "DEBUG: Container is DISABLED (value: $containerStatus)"
 }
 
 :if ($containerEnabled != true) do={
