@@ -4,7 +4,7 @@
 # Version: 1.0.1
 # Author:  Maxim Priezjev
 # Date:    February 15, 2026
-# Tested on: RouterOS 7.20.3
+# Tested on: RouterOS 7.21.3
 # 
 # Description:
 #   This script automates the deployment and upgrade of AdGuard Home as a
