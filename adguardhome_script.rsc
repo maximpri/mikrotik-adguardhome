@@ -78,12 +78,12 @@
 
 :put ("Detected RouterOS version: " . $rosVersion . " (major: " . $majorVersion . ", minor: " . $minorVersion . ")")
 
-## Check minimum version requirement (7.20)
+## Check minimum version requirement (7.21)
 :local versionOk false
 :if ([:tonum $majorVersion] > 7) do={
     :set versionOk true
 } else={
-    :if ([:tonum $majorVersion] = 7 && [:tonum $minorVersion] >= 20) do={
+    :if ([:tonum $majorVersion] = 7 && [:tonum $minorVersion] >= 21) do={
         :set versionOk true
     }
 }
