@@ -148,7 +148,7 @@
 ## Check and create envlist if it doesn't exist
 :put "Checking env list configuration..."
 :if ([:len [/container envs find list=$cEnvListName]] = 0) do={
-    :put ("Creating mount: " . $cMountListName)
+    :put ("Creating env list: " . $cEnvListName)
     /container envs add list=$cEnvListName key=QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING  value=true
 } else={
     :put ("Env list " . $cEnvListName . " already exists")
