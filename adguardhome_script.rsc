@@ -1,7 +1,7 @@
 # ============================================================================
 # AdGuard Home Container Deployment Script for MikroTik RouterOS
 # ============================================================================
-# Version: 1.0.0
+# Version: 1.0.1
 # Author:  Maxim Priezjev
 # Date:    February 15, 2026
 # Tested on: RouterOS 7.20.3
