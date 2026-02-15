@@ -3,8 +3,8 @@
 # ============================================================================
 # Version: 1.0.0
 # Author:  Maxim Priezjev
-# Date:    January 7, 2026
-# Tested on: RouterOS 7.20.2
+# Date:    February 15, 2026
+# Tested on: RouterOS 7.20.3
 # 
 # Description:
 #   This script automates the deployment and upgrade of AdGuard Home as a
@@ -44,11 +44,12 @@
 :local cInterface "agh"
 :local cRootDir "/disk1/agh"
 :local cTmpDir "/disk1/tmp"
-:local cMountName "agh_conf"
+:local cMountListName "agh_conf"
 :local cMountSrc "/disk1/conf/agh"
 :local cMountDst "/opt/adguardhome/conf"
+:local cEnvListName "AGH"
 :local cRegistryUrl "https://registry-1.docker.io"
-:local cMinVersion "7.20"
+:local cMinVersion "7.21"
 
 ## ========================================
 ## RouterOS Version Check
@@ -137,11 +138,20 @@
 
 ## Check and create mount if it doesn't exist
 :put "Checking mount configuration..."
-:if ([:len [/container mounts find name=$cMountName]] = 0) do={
-    :put ("Creating mount: " . $cMountName)
-    /container mounts add name=$cMountName src=$cMountSrc dst=$cMountDst
+:if ([:len [/container mounts find list=$cMountListName]] = 0) do={
+    :put ("Creating mount: " . $cMountListName)
+    /container mounts add list=$cMountListName src=$cMountSrc dst=$cMountDst
 } else={
-    :put ("Mount " . $cMountName . " already exists")
+    :put ("Mount " . $cMountListName . " already exists")
+}
+
+## Check and create envlist if it doesn't exist
+:put "Checking env list configuration..."
+:if ([:len [/container envs find list=$cEnvListName]] = 0) do={
+    :put ("Creating mount: " . $cMountListName)
+    /container envs add list=$cEnvListName key=QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING  value=true
+} else={
+    :put ("Env list " . $cEnvListName . " already exists")
 }
 
 ## Check and create veth interface if it doesn't exist
@@ -212,10 +222,11 @@
 :log info "Pulling and adding $cImage..."
 :put "Pulling and adding $cImage..."
 /container add remote-image=$cImage name=$cName \
-    interface=$cInterface logging=yes mounts=$cMountName start-on-boot=yes \
+    interface=$cInterface logging=yes mountlists=$cMountListName start-on-boot=yes \
     root-dir=$cRootDir workdir="/opt/adguardhome/work" \
     cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
-    entrypoint=/opt/adguardhome/AdGuardHome
+    entrypoint=/opt/adguardhome/AdGuardHome \
+    envlist=$cEnvListName
 
 ## Wait for pull and extraction
 :log info "Waiting for container to be ready (pulling/extracting)..."

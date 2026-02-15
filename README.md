@@ -12,7 +12,7 @@ Automated deployment and upgrade script for running [AdGuard Home](https://adgua
 
 ## Requirements
 
-- MikroTik RouterOS **7.20 or higher**
+- MikroTik RouterOS **7.21 or higher**
 - Router with container support (ARM, ARM64, or x86)
 - USB storage or disk mounted (default: `/usb1`)
 - Network connectivity to Docker Hub
@@ -72,7 +72,7 @@ After the first successful deployment:
 ┌─────────────────────────────────────────────────────────────┐
 │                    Script Execution Flow                     │
 ├─────────────────────────────────────────────────────────────┤
-│  1. Check RouterOS version (≥7.20)                          │
+│  1. Check RouterOS version (≥7.21)                          │
 │  2. Enable container feature (if disabled) → reboot         │
 │  3. Configure Docker registry                                │
 │  4. Create mount point (if missing)                         │
@@ -114,7 +114,7 @@ MIT License - Feel free to use and modify.
 
 ## Author
 
-**Maxim Priezjev** - January 2026
+**Maxim Priezjev** - February 2026
 
 ## Contributing
 
