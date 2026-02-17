@@ -21,7 +21,7 @@
 #
 # Prerequisites:
 #   - RouterOS 7.x with container support (CHR, ARM, ARM64, or TILE)
-#   - USB storage mounted at /usb1 (or modify cRootDir variable)
+#   - USB storage mounted at /usb1 (or modify cDefaultStorageMount variable)
 #   - Network connectivity to Docker Hub
 #
 # Post-deployment steps (first-time only):
@@ -42,10 +42,11 @@
 :local cName "adguardhome"
 :local cImage "adguard/adguardhome:latest"
 :local cInterface "agh"
-:local cRootDir "/disk1/agh"
-:local cTmpDir "/disk1/tmp"
+:local cDefaultStorageMount "/usb1"
+:local cRootDir ($cDefaultStorageMount . "/agh")
+:local cTmpDir ($cDefaultStorageMount . "/tmp")
 :local cMountListName "agh_conf"
-:local cMountSrc "/disk1/conf/agh"
+:local cMountSrc ($cDefaultStorageMount . "/conf/agh")
 :local cMountDst "/opt/adguardhome/conf"
 :local cEnvListName "AGH"
 :local cRegistryUrl "https://registry-1.docker.io"
