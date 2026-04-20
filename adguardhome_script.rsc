@@ -57,7 +57,7 @@
 :local cEnvListName "AGH"
 :local cRegistryUrl "https://registry-1.docker.io"
 :local cRequiredMinorVersion "22"
-:local cScriptVersion "1.6.0"
+:local cScriptVersion "1.6.1"
 
 ## Timeout configuration (adjust for slow USB/large images)
 :local cPullTimeout 300
@@ -223,9 +223,8 @@
 :set milestoneNum ($milestoneNum + 1)
 :put ("[" . $milestoneNum . "/" . $milestoneTotal . "] Container Feature...")
 
-:local containerStatus [/system device-mode get container]
 :local containerEnabled false
-:if ($containerStatus = "yes" || $containerStatus = true || $containerStatus = "true") do={
+:if ([:find [/system/device-mode print] "container: yes"] != nil) do={
     :set containerEnabled true
 }
 
