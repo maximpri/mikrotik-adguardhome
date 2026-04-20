@@ -5,15 +5,16 @@ Automated deployment and upgrade script for running [AdGuard Home](https://adgua
 ## Features
 
 - **First-time setup**: Automatically enables container feature, configures Docker registry, creates mount points, and provisions veth interface
-- **Upgrade mode**: Safely stops and removes existing container before pulling the latest image
+- **Upgrade mode**: Uses RouterOS 7.22+ `/container repull` command for seamless updates (no manual stop/remove required)
+- **Visual progress**: Clear milestone markers `[OK]`/`[FAILED]` with tree structure showing step completion
 - **Status monitoring**: Real-time terminal output showing deployment progress
 - **Error handling**: Graceful timeout handling with informative error messages
 - **Version check**: Validates RouterOS version compatibility before execution
 
 ## Requirements
 
-- MikroTik RouterOS **7.21 or higher**
-- Router with container support (ARM, ARM64, or x86)
+- MikroTik RouterOS **7.22 or higher** (required for `/container repull` feature)
+- Router with container support (ARM, ARM64, x86, or TILE)
 - USB storage or disk mounted (default: `/usb1`)
 - Network connectivity to Docker Hub
 
@@ -22,7 +23,7 @@ Automated deployment and upgrade script for running [AdGuard Home](https://adgua
 ### Option 1: Import directly
 
 ```routeros
-/tool fetch url="https://raw.githubusercontent.com/YOUR_USERNAME/mikrotik-adguardhome/main/adguardhome_script.rsc"
+/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc"
 /import adguardhome_script.rsc
 ```
 
@@ -72,16 +73,86 @@ After the first successful deployment:
 ┌─────────────────────────────────────────────────────────────┐
 │                    Script Execution Flow                     │
 ├─────────────────────────────────────────────────────────────┤
-│  1. Check RouterOS version (≥7.21)                          │
-│  2. Enable container feature (if disabled) → reboot         │
-│  3. Configure Docker registry                                │
-│  4. Create mount point (if missing)                         │
-│  5. Create veth interface (if missing)                      │
-│  6. Stop & remove existing container (if upgrading)         │
-│  7. Pull latest image & create container                    │
-│  8. Wait for extraction to complete                         │
-│  9. Start container                                         │
+│  1. Check RouterOS version (≥7.22)                          │
+│  2. Pre-flight checks:                                      │
+│     - Verify storage mount exists                           │
+│     - Create required directories                           │
+│     - Test network connectivity to Docker Hub               │
+│  3. Enable container feature (if disabled) → reboot         │
+│  4. Configure Docker registry                                │
+│  5. Create mount point (if missing)                         │
+│  6. Create veth interface (if missing)                      │
+│  7. If container exists:                                     │
+│     - Use /container repull (RouterOS 7.22+ feature)        │
+│     - Automatic stop/repull/start handled by RouterOS       │
+│     - Monitor for errors during extraction                  │
+│  8. If first-time:                                           │
+│     - Pull latest image & create container                   │
+│     - Wait for extraction (with error detection)            │
+│     - Start container                                       │
+│  9. Post-deployment verification:                           │
+│     - Check uptime for stable run                           │
+│     - Retrieve container logs                               │
+│     - Report SUCCESS VERIFIED or FAILED                     │
 └─────────────────────────────────────────────────────────────┘
+```
+
+## RouterOS 7.22+ Features
+
+This script leverages the new RouterOS 7.22 container improvements:
+- **Automatic repull**: `/container repull` handles stop/repull/start automatically
+- **zstd extraction**: Faster image extraction with zstd compression support
+- **Improved error handling**: Better error messages when container fails to start
+
+## Robust Deployment Verification
+
+The script includes comprehensive checks to ensure deployment success:
+
+### Pre-flight Checks
+- **Storage verification**: Validates USB/disk mount exists before deployment
+- **Directory creation**: Creates required directories (`/usb1/agh`, `/usb1/conf/agh`, `/usb1/tmp`)
+- **Network connectivity**: Blocks if Docker Hub unreachable (blocking check)
+
+### Deployment Monitoring
+- **Error detection**: Monitors container status for "error" or "failed" states during extraction
+- **Progress tracking**: Real-time status updates every 5 seconds
+
+### Post-deployment Verification
+- **Uptime check**: Verifies container has stable uptime (not just "running" flag)
+- **Log inspection**: Retrieves container logs to surface any startup errors
+- **Final state report**: Shows "SUCCESS VERIFIED" or "FAILED" with details
+
+### Visual Progress Output
+
+The script displays clear milestone markers during execution:
+
+```
+========================================
+  AdGuard Home Deployment v1.3.0
+========================================
+
+[1/8] RouterOS Version Check...
+      |-- Detected: 7.22.1
+      |-- Required: >= 7.22
+      |-- [OK] Version verified
+
+[2/8] Pre-flight Checks...
+      |-- Storage mount...
+      |   |-- [OK] /usb1 verified
+      |-- Network connectivity...
+      |   |-- [OK] Docker Hub reachable
+      |-- [OK] Pre-flight checks passed
+
+...
+
+[8/8] Container Deployment...
+      |-- Mode: First-time deployment
+      |-- Image: adguard/adguardhome:latest
+      |-- [OK] Deployment completed
+
+========================================
+  DEPLOYMENT SUCCESSFUL
+========================================
 ```
 
 ## Upgrading AdGuard Home
@@ -96,14 +167,17 @@ Your configuration is preserved in the mounted volume.
 
 ## Troubleshooting
 
-### Container won't stop
-The script waits up to 60 seconds for the container to stop. If it times out, try manually stopping it:
+### Container won't start after repull
+RouterOS 7.22+ automatically handles the repull process. If the container fails to start after a repull:
 ```routeros
-/container stop [find name=adguardhome]
+/container start [find name=adguardhome]
 ```
 
-### Image extraction takes too long
-The script waits up to 5 minutes for image extraction. On slower hardware or USB storage, this may take longer. You can increase `extractTimeout` in the script.
+### Repull takes too long
+The script waits up to 5 minutes for repull completion. On slower hardware or USB storage, this may take longer. You can check the container status:
+```routeros
+/container print detail
+```
 
 ### Container feature not available
 Ensure your RouterOS license and hardware support containers. CHR requires a paid license for container support.
@@ -114,7 +188,7 @@ MIT License - Feel free to use and modify.
 
 ## Author
 
-**Maxim Priezjev** - February 2026
+**Maxim Priezjev** - April 2026
 
 ## Contributing
 
