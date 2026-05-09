@@ -35,6 +35,8 @@
 #   2. Set up firewall/NAT rules as needed
 #   3. Access AdGuard Home web UI (default: http://<container-ip>:3000)
 #   4. Complete initial AdGuard Home setup wizard
+#   5. IF port was changed (per default wizard), update healthcheck to monitor new port
+#      /container/set adguardhome healthcheck-cmd="wget -q --spider http://localhost:80 || exit 1"
 #
 # Usage:
 #   /import adguardhome_script.rsc
@@ -450,6 +452,7 @@
         interface=$cInterface logging=yes mountlists=$cMountListName start-on-boot=yes \
         root-dir=$cRootDir workdir="/opt/adguardhome/work" \
         cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
+        healthcheck-cmd="wget -q --spider http://localhost:3000 || exit 1" \
         entrypoint=/opt/adguardhome/AdGuardHome \
         envlist=$cEnvListName
 
