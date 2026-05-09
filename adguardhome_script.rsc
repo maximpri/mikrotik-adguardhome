@@ -56,6 +56,7 @@
 :local cMountDst "/opt/adguardhome/conf"
 :local cEnvListName "AGH"
 :local cRegistryUrl "https://registry-1.docker.io"
+:local cCheckCertificate "no"
 :local cRequiredMinorVersion "22"
 :local cScriptVersion "1.6.1"
 
@@ -451,7 +452,8 @@
         root-dir=$cRootDir workdir="/opt/adguardhome/work" \
         cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
         entrypoint=/opt/adguardhome/AdGuardHome \
-        envlist=$cEnvListName
+        envlist=$cEnvListName \
+        check-certificate=$cCheckCertificate
 
     ## Wait for extraction with percentage progress
     :local extractTimeout $cPullTimeout
