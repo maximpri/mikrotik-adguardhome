@@ -9,12 +9,13 @@ An idempotent RouterOS script that deploys and upgrades [AdGuard Home](https://a
 - Creates or validates persistent AdGuard Home configuration and work-data mounts.
 - Creates a statically addressed veth interface.
 - Performs first-time image pull, extraction, start, and stability checks.
-- Uses RouterOS 7.22's automatic stop/repull/start behavior for upgrades.
+- Uses RouterOS 7.22+'s automatic stop/repull/start behavior for upgrades.
+- Configures native container healthchecks on RouterOS 7.23 and later.
 - Preserves the router's DNS, static DNS records, firewall, and bridge configuration.
 
 ## Requirements
 
-- RouterOS **7.22.x**. The script intentionally rejects other releases because its repull workflow is specific to 7.22 and has not been tested on later versions.
+- RouterOS **7.22 or later**.
 - The RouterOS `container` package, installed and enabled.
 - An ARM, ARM64, x86, or CHR system supported by the container package.
 - External storage mounted at `/usb1`, or a customized storage path.
@@ -53,6 +54,7 @@ Edit the variables near the top of `adguardhome_script.rsc` before importing it:
 :local cContainerAddress "172.17.0.2/24"
 :local cContainerGateway "172.17.0.1"
 :local cPullTimeout 300
+:local cHealthcheckCmd "sh -c 'wget -q --spider http://127.0.0.1:3000 || wget -q --spider http://127.0.0.1:80'"
 ```
 
 Derived defaults are:
@@ -67,6 +69,25 @@ Derived defaults are:
 | Work data in container | `/opt/adguardhome/work` |
 
 `latest` is convenient for automatic upgrades but is mutable. Set `cImage` to a specific AdGuard Home tag if you need repeatable deployments.
+
+## Health monitoring
+
+Health monitoring depends on the RouterOS release:
+
+| RouterOS version | Monitoring behavior |
+|---|---|
+| 7.22 | The script verifies that the container starts and remains running. Native healthchecks are unavailable. |
+| 7.23 and later | The script also configures RouterOS native container healthchecks for new and existing containers. |
+
+The default healthcheck probes AdGuard Home's first-run UI on port `3000` and its normal web UI on port `80`. If you configure a different web port, update `cHealthcheckCmd` near the top of the script. The default settings run the probe every 30 seconds, allow a two-minute startup grace period, time out after 10 seconds, and mark the service unhealthy after three consecutive failures.
+
+Inspect the native status on RouterOS 7.23 or later:
+
+```routeros
+/container print proplist=name,healthcheck-status
+```
+
+Running the deployment script again reconciles the healthcheck on containers created by earlier script versions.
 
 ## Complete the network setup
 
@@ -98,7 +119,7 @@ Run the script again. When the named container exists, it calls:
 /container repull [find name=adguardhome] remote-image=adguard/adguardhome:latest
 ```
 
-RouterOS 7.22 automatically stops, repulls, and restarts the container. The script waits up to five minutes by default and then verifies that the container remains running.
+RouterOS 7.22 and later automatically stop, repull, and restart the container. The script waits up to five minutes by default and then verifies that the container remains running. On RouterOS 7.23 and later, it also applies the configured native healthcheck before repulling.
 
 The persistent configuration and work-data mounts are retained. If an existing mount destination points to a different source directory, the script stops instead of silently switching data.
 
