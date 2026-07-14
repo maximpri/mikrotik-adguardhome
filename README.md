@@ -1,196 +1,138 @@
-# AdGuard Home Container Script for MikroTik RouterOS
+# AdGuard Home for MikroTik RouterOS
 
-Automated deployment and upgrade script for running [AdGuard Home](https://adguard.com/en/adguard-home/overview.html) as a container on MikroTik routers.
+An idempotent RouterOS script that deploys and upgrades [AdGuard Home](https://adguard.com/en/adguard-home/overview.html) as a MikroTik container.
 
-## Features
+## What it does
 
-- **First-time setup**: Automatically enables container feature, configures Docker registry, creates mount points, and provisions veth interface
-- **Upgrade mode**: Uses RouterOS 7.22+ `/container repull` command for seamless updates (no manual stop/remove required)
-- **Visual progress**: Clear milestone markers `[OK]`/`[FAILED]` with tree structure showing step completion
-- **Status monitoring**: Real-time terminal output showing deployment progress
-- **Error handling**: Graceful timeout handling with informative error messages
-- **Version check**: Validates RouterOS version compatibility before execution
+- Validates RouterOS, the container package, external storage, DNS, and Docker Hub access.
+- Configures the Docker Hub registry and extraction directory.
+- Creates or validates persistent AdGuard Home configuration and work-data mounts.
+- Creates a statically addressed veth interface.
+- Performs first-time image pull, extraction, start, and stability checks.
+- Uses RouterOS 7.22's automatic stop/repull/start behavior for upgrades.
+- Preserves the router's DNS, static DNS records, firewall, and bridge configuration.
 
 ## Requirements
 
-- MikroTik RouterOS **7.22 or higher** (required for `/container repull` feature)
-- Router with container support (ARM, ARM64, x86, or TILE)
-- USB storage or disk mounted (default: `/usb1`)
-- Network connectivity to Docker Hub
+- RouterOS **7.22.x**. The script intentionally rejects other releases because its repull workflow is specific to 7.22 and has not been tested on later versions.
+- The RouterOS `container` package, installed and enabled.
+- An ARM, ARM64, x86, or CHR system supported by the container package.
+- External storage mounted at `/usb1`, or a customized storage path.
+- Working router DNS and internet access to Docker Hub.
+- Physical access if container device-mode is not already enabled.
 
-## Quick Start
+MikroTik recommends fast external storage for containers. Slow flash drives can require a larger `cPullTimeout`.
 
-### Option 1: Import directly
+## Quick start
+
+Fetch and import the script:
 
 ```routeros
 /tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc"
 /import adguardhome_script.rsc
 ```
 
-### Option 2: Create as a scheduled script
+Alternatively, store it as a reusable RouterOS script:
 
 ```routeros
 /system script add name=adguardhome-deploy source=[/file get adguardhome_script.rsc contents]
 /system script run adguardhome-deploy
 ```
 
+If container device-mode is disabled, RouterOS requires physical confirmation. Follow the command's activation instructions, let the router restart, and run the deployment script again.
+
 ## Configuration
 
-Edit the variables at the top of the script to match your setup:
+Edit the variables near the top of `adguardhome_script.rsc` before importing it:
 
 ```routeros
-:local cName "adguardhome"           # Container name
-:local cImage "adguard/adguardhome:latest"  # Docker image
-:local cInterface "agh"              # veth interface name
-:local cRootDir "/usb1/agh"          # Container root directory
-:local cTmpDir "/usb1/tmp"           # Temp directory for image pulls
-:local cMountName "agh_conf"         # Mount name for config persistence
-:local cMountSrc "/usb1/conf/agh"    # Host path for config
-:local cMountDst "/opt/adguardhome/conf"  # Container path for config
+:local cName "adguardhome"
+:local cImage "adguard/adguardhome:latest"
+:local cInterface "agh"
+:local cDefaultStorageMount "/usb1"
+:local cContainerAddress "172.17.0.2/24"
+:local cContainerGateway "172.17.0.1"
+:local cPullTimeout 300
 ```
 
-## Post-Deployment Steps (First-time only)
+Derived defaults are:
 
-After the first successful deployment:
+| Purpose | Path |
+|---|---|
+| Container root | `/usb1/agh` |
+| Extraction temp | `/usb1/tmp` |
+| Persistent configuration | `/usb1/conf/agh` |
+| Configuration in container | `/opt/adguardhome/conf` |
+| Persistent work data | `/usb1/work/agh` |
+| Work data in container | `/opt/adguardhome/work` |
 
-1. **Configure IP address** on the veth interface:
-   ```routeros
-   /ip address add address=172.17.0.1/24 interface=agh
-   ```
+`latest` is convenient for automatic upgrades but is mutable. Set `cImage` to a specific AdGuard Home tag if you need repeatable deployments.
 
-2. **Set up NAT** (if needed):
-   ```routeros
-   /ip firewall nat add chain=srcnat src-address=172.17.0.0/24 action=masquerade
-   ```
+## Complete the network setup
 
-3. **Access AdGuard Home** web UI at `http://172.17.0.2:3000` (or your container IP)
+The script assigns `172.17.0.2/24` and gateway `172.17.0.1` to the `agh` veth. It deliberately does not change bridges or firewall rules because those are router-specific.
 
-4. **Complete the setup wizard** in the web interface
+For a new, isolated container network, run these commands once:
 
-## How It Works
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Script Execution Flow                     │
-├─────────────────────────────────────────────────────────────┤
-│  1. Check RouterOS version (≥7.22)                          │
-│  2. Pre-flight checks:                                      │
-│     - Verify storage mount exists                           │
-│     - Create required directories                           │
-│     - Test network connectivity to Docker Hub               │
-│  3. Enable container feature (if disabled) → reboot         │
-│  4. Configure Docker registry                                │
-│  5. Create mount point (if missing)                         │
-│  6. Create veth interface (if missing)                      │
-│  7. If container exists:                                     │
-│     - Use /container repull (RouterOS 7.22+ feature)        │
-│     - Automatic stop/repull/start handled by RouterOS       │
-│     - Monitor for errors during extraction                  │
-│  8. If first-time:                                           │
-│     - Pull latest image & create container                   │
-│     - Wait for extraction (with error detection)            │
-│     - Start container                                       │
-│  9. Post-deployment verification:                           │
-│     - Check uptime for stable run                           │
-│     - Retrieve container logs                               │
-│     - Report SUCCESS VERIFIED or FAILED                     │
-└─────────────────────────────────────────────────────────────┘
+```routeros
+/interface bridge add name=containers
+/ip address add address=172.17.0.1/24 interface=containers
+/interface bridge port add bridge=containers interface=agh
+/ip firewall nat add chain=srcnat action=masquerade src-address=172.17.0.0/24
 ```
 
-## RouterOS 7.22+ Features
+If you already have a container bridge, attach `agh` to it and use addressing that matches that bridge instead. Do not create a second overlapping `172.17.0.0/24` network.
 
-This script leverages the new RouterOS 7.22 container improvements:
-- **Automatic repull**: `/container repull` handles stop/repull/start automatically
-- **zstd extraction**: Faster image extraction with zstd compression support
-- **Improved error handling**: Better error messages when container fails to start
+After the container starts:
 
-## Robust Deployment Verification
+1. Open `http://172.17.0.2:3000`.
+2. Complete the AdGuard Home setup wizard.
+3. Allow DNS traffic only from the networks that should use the resolver.
+4. Point those clients, DHCP scopes, or the router DNS configuration at the AdGuard Home address.
 
-The script includes comprehensive checks to ensure deployment success:
+## Upgrades
 
-### Pre-flight Checks
-- **Storage verification**: Validates USB/disk mount exists before deployment
-- **Directory creation**: Creates required directories (`/usb1/agh`, `/usb1/conf/agh`, `/usb1/tmp`)
-- **Network connectivity**: Blocks if Docker Hub unreachable (blocking check)
+Run the script again. When the named container exists, it calls:
 
-### Deployment Monitoring
-- **Error detection**: Monitors container status for "error" or "failed" states during extraction
-- **Progress tracking**: Real-time status updates every 5 seconds
-
-### Post-deployment Verification
-- **Uptime check**: Verifies container has stable uptime (not just "running" flag)
-- **Log inspection**: Retrieves container logs to surface any startup errors
-- **Final state report**: Shows "SUCCESS VERIFIED" or "FAILED" with details
-
-### Visual Progress Output
-
-The script displays clear milestone markers during execution:
-
-```
-========================================
-  AdGuard Home Deployment v1.3.0
-========================================
-
-[1/8] RouterOS Version Check...
-      |-- Detected: 7.22.1
-      |-- Required: >= 7.22
-      |-- [OK] Version verified
-
-[2/8] Pre-flight Checks...
-      |-- Storage mount...
-      |   |-- [OK] /usb1 verified
-      |-- Network connectivity...
-      |   |-- [OK] Docker Hub reachable
-      |-- [OK] Pre-flight checks passed
-
-...
-
-[8/8] Container Deployment...
-      |-- Mode: First-time deployment
-      |-- Image: adguard/adguardhome:latest
-      |-- [OK] Deployment completed
-
-========================================
-  DEPLOYMENT SUCCESSFUL
-========================================
+```routeros
+/container repull [find name=adguardhome] remote-image=adguard/adguardhome:latest
 ```
 
-## Upgrading AdGuard Home
+RouterOS 7.22 automatically stops, repulls, and restarts the container. The script waits up to five minutes by default and then verifies that the container remains running.
 
-Simply run the script again - it will automatically:
-- Stop the running container
-- Remove the old container
-- Pull the latest image
-- Start the new container
+The persistent configuration and work-data mounts are retained. If an existing mount destination points to a different source directory, the script stops instead of silently switching data.
 
-Your configuration is preserved in the mounted volume.
+Deployments made with script versions before 1.7.0 may have only the configuration mount. The script stops rather than add an empty work-data mount that would hide existing data. Back up `/opt/adguardhome/work`, add a mount from `/usb1/work/agh` to that destination, and restore the data before the next repull.
 
 ## Troubleshooting
 
-### Container won't start after repull
-RouterOS 7.22+ automatically handles the repull process. If the container fails to start after a repull:
-```routeros
-/container start [find name=adguardhome]
-```
+Inspect container state and logs:
 
-### Repull takes too long
-The script waits up to 5 minutes for repull completion. On slower hardware or USB storage, this may take longer. You can check the container status:
 ```routeros
 /container print detail
+/container log adguardhome
 ```
 
-### Container feature not available
-Ensure your RouterOS license and hardware support containers. CHR requires a paid license for container support.
+Check storage and DNS:
+
+```routeros
+/disk print
+/file print
+/ip dns print
+:put [:resolve registry-1.docker.io]
+```
+
+If image extraction exceeds five minutes, increase `cPullTimeout`. If the container has no network access, verify the veth address, bridge membership, gateway address, and masquerade rule.
+
+## Security notes
+
+- Container support expands the router's attack surface. Keep RouterOS and AdGuard Home patched.
+- Do not expose the setup UI or DNS service to untrusted networks.
+- Review the image tag before upgrades; `latest` can change at any time.
+- The script does not overwrite router DNS servers or delete static DNS records.
+
+See MikroTik's [Container documentation](https://manual.mikrotik.com/docs/containers/) and [device-mode documentation](https://manual.mikrotik.com/docs/system-information-and-utilities/device-mode/) for platform details.
 
 ## License
 
-MIT License - Feel free to use and modify.
-
-## Author
-
-**Maxim Priezjev** - April 2026
-
-## Contributing
-
-Issues and pull requests are welcome!
-
+[MIT](LICENSE)
