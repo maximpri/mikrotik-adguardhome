@@ -1,13 +1,13 @@
 # ============================================================================
 # AdGuard Home Container Deployment Script for MikroTik RouterOS
 # ============================================================================
-# Version: 1.7.0
+# Version: 1.8.0
 # Author:  Maxim Priezjev
 # Date:    July 14, 2026
-# Tested on: RouterOS 7.22.1
+# Minimum RouterOS: 7.22
 #
-# IMPORTANT: This script is tested only on RouterOS 7.22.x
-#            Do not use on 7.23 or later without testing first
+# IMPORTANT: RouterOS 7.23+ supports native container healthchecks. RouterOS
+#            7.22 remains supported with the script's running/stability checks.
 #
 # Description:
 #   This script automates the deployment and upgrade of AdGuard Home as a
@@ -24,9 +24,10 @@
 #   - Safe networking: Preserves the router's DNS and static DNS configuration
 #   - Idempotent setup: Validates existing mounts, envs, and veth settings
 #   - Double verification: Stability check after initial deployment
+#   - Health monitoring: Configures native healthchecks on RouterOS 7.23+
 #
 # Prerequisites:
-#   - RouterOS 7.22.x with container support (ARM, ARM64, x86, or CHR)
+#   - RouterOS 7.22 or later with container support (ARM, ARM64, x86, or CHR)
 #   - USB storage mounted at /usb1 (or modify cDefaultStorageMount variable)
 #   - Network connectivity to Docker Hub
 #
@@ -61,8 +62,18 @@
 :local cRegistryHost "registry-1.docker.io"
 :local cContainerAddress "172.17.0.2/24"
 :local cContainerGateway "172.17.0.1"
-:local cRequiredMinorVersion "22"
-:local cScriptVersion "1.7.0"
+:local cMinimumMinorVersion 22
+:local cHealthcheckMinorVersion 23
+:local cScriptVersion "1.8.0"
+
+## RouterOS 7.23+ native healthcheck configuration. The default command covers
+## both the first-run setup UI (port 3000) and the normal web UI (port 80).
+## Change this command if AdGuard Home uses a custom web port.
+:local cHealthcheckCmd "sh -c 'wget -q --spider http://127.0.0.1:3000 || wget -q --spider http://127.0.0.1:80'"
+:local cHealthcheckInterval "00:00:30"
+:local cHealthcheckTimeout "00:00:10"
+:local cHealthcheckStartPeriod "00:02:00"
+:local cHealthcheckRetries 3
 
 ## Timeout configuration (adjust for slow USB/large images)
 :local cPullTimeout 300
@@ -111,29 +122,52 @@
 }
 
 :local versionOk false
-## Only allow RouterOS 7.22.x (block 7.23 and later)
-:if ([:tonum $majorVersion] = 7 && [:tonum $minorVersion] = [:tonum $cRequiredMinorVersion]) do={
+:local majorNumber [:tonum $majorVersion]
+:local minorNumber [:tonum $minorVersion]
+
+## Allow RouterOS 7.22 and every later release.
+:if ($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= $cMinimumMinorVersion)) do={
     :set versionOk true
+}
+
+:local healthcheckSupported false
+:if ($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= $cHealthcheckMinorVersion)) do={
+    :set healthcheckSupported true
+}
+
+## Keep 7.23-only properties inside a runtime-parsed command. This prevents
+## RouterOS 7.22 from rejecting the script while parsing an unreachable branch.
+:local healthcheckSetCommand ""
+:if ($healthcheckSupported = true) do={
+    :set healthcheckSetCommand ("/container set [find name=\"" . $cName . "\"]" . \
+        " healthcheck-cmd=\"" . $cHealthcheckCmd . "\"" . \
+        " healthcheck-interval=\"" . $cHealthcheckInterval . "\"" . \
+        " healthcheck-timeout=\"" . $cHealthcheckTimeout . "\"" . \
+        " healthcheck-start-period=\"" . $cHealthcheckStartPeriod . "\"" . \
+        " healthcheck-retries=" . $cHealthcheckRetries)
 }
 
 :if ($versionOk = true) do={
     :put ("      |-- Detected: " . $rosVersion)
-    :put ("      |-- Required: 7.22.x (this script tested on 7.22 only)")
+    :put "      |-- Required: 7.22 or later"
+    :if ($healthcheckSupported = true) do={
+        :put "      |-- Native container healthchecks: supported"
+    } else={
+        :put "      |-- Native container healthchecks: unavailable on 7.22"
+        :put "      |-- Using script running/stability checks"
+    }
     :put "      |-- [OK] Version verified"
 } else={
     :put ("      |-- Detected: " . $rosVersion)
-    :put "      |-- Required: 7.22.x only"
+    :put "      |-- Required: 7.22 or later"
     :put "      |-- [FAILED] Version mismatch"
     :put "      |-- DEBUG INFO:"
     :put ("      |   |-- majorVersion=" . $majorVersion)
     :put ("      |   |-- minorVersion=" . $minorVersion)
-    :put ("      |   |-- Required: 7." . $cRequiredMinorVersion . ".*")
-    :if ([:tonum $minorVersion] > [:tonum $cRequiredMinorVersion]) do={
-        :put "      |   |-- Note: Later versions may have API changes"
-    }
-    :put "      |   |-- Fix: Use script version for your RouterOS release"
+    :put ("      |   |-- Minimum: 7." . $cMinimumMinorVersion)
+    :put "      |   |-- Fix: Upgrade RouterOS and the container package"
     :set deploymentSuccess false
-    :log error ("RouterOS version not supported: " . $rosVersion . " (requires 7.22.x)")
+    :log error ("RouterOS version not supported: " . $rosVersion . " (requires 7.22 or later)")
     :error "Version check failed"
 }
 
@@ -420,6 +454,28 @@
     :put "      |-- Mode: Upgrade (repull)"
     :put ("      |-- Image: " . $cImage)
 
+    ## Reconcile healthchecks for containers created by earlier script versions.
+    :if ($healthcheckSupported = true) do={
+        :put "      |-- Configuring native healthcheck..."
+        :local healthcheckConfigured false
+        :do {
+            :local applyHealthcheck [:parse $healthcheckSetCommand]
+            $applyHealthcheck
+            :set healthcheckConfigured true
+            :put "      |   |-- [OK] Healthcheck configured"
+        } on-error={
+            :put "      |   |-- [FAILED] RouterOS rejected the healthcheck settings"
+            :put "      |   |-- Check the container package version"
+            :set deploymentSuccess false
+        }
+
+        :if ($healthcheckConfigured = false) do={
+            :error "Healthcheck configuration failed"
+        }
+    } else={
+        :put "      |-- Native healthcheck unavailable; using stability checks"
+    }
+
     :put "      |-- Triggering repull..."
 
     :local repullStarted false
@@ -584,6 +640,27 @@
     }
 
     :if ($isStopped = true) do={
+        :if ($healthcheckSupported = true) do={
+            :put "      |-- Configuring native healthcheck..."
+            :local healthcheckConfigured false
+            :do {
+                :local applyHealthcheck [:parse $healthcheckSetCommand]
+                $applyHealthcheck
+                :set healthcheckConfigured true
+                :put "      |   |-- [OK] Healthcheck configured"
+            } on-error={
+                :put "      |   |-- [FAILED] RouterOS rejected the healthcheck settings"
+                :put "      |   |-- Check the container package version"
+                :set deploymentSuccess false
+            }
+
+            :if ($healthcheckConfigured = false) do={
+                :error "Healthcheck configuration failed"
+            }
+        } else={
+            :put "      |-- Native healthcheck unavailable; using stability checks"
+        }
+
         :put "      |-- Starting container..."
         /container start [find name=$cName]
         :delay $cStartDelay
@@ -692,6 +769,10 @@
 
 :if ($deployOk = true && $deploymentSuccess = true) do={
     :put "      |-- [OK] Deployment completed"
+    :if ($healthcheckSupported = true) do={
+        :put "      |-- Native healthcheck is starting (up to 2 minutes grace)"
+        :put "      |-- Run: /container print proplist=name,healthcheck-status"
+    }
 } else={
     :put "      |-- [FAILED] Deployment failed"
 }
