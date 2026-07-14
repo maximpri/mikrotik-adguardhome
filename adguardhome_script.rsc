@@ -1,9 +1,9 @@
 # ============================================================================
 # AdGuard Home Container Deployment Script for MikroTik RouterOS
 # ============================================================================
-# Version: 1.6.0
+# Version: 1.7.0
 # Author:  Maxim Priezjev
-# Date:    April 20, 2026
+# Date:    July 14, 2026
 # Tested on: RouterOS 7.22.1
 #
 # IMPORTANT: This script is tested only on RouterOS 7.22.x
@@ -19,20 +19,20 @@
 #     Docker registry, creates mount points, and provisions veth interface
 #   - Upgrade mode: Uses RouterOS 7.22+ automatic repull feature for seamless
 #     container updates (no manual stop/remove required)
-#   - Visual progress: Percentage-based progress with [OK]/[FAILED] markers
-#   - Error handling: Graceful timeout handling with rollback on failure
-#   - DNS management: Sets 1.1.1.1 during pull, restores after completion
-#   - Auto cleanup: Removes stale reverse DNS entries for 172.17.0.1
+#   - Visual progress: Timed status updates with [OK]/[FAILED] markers
+#   - Error handling: Graceful timeout handling with cleanup on failure
+#   - Safe networking: Preserves the router's DNS and static DNS configuration
+#   - Idempotent setup: Validates existing mounts, envs, and veth settings
 #   - Double verification: Stability check after initial deployment
 #
 # Prerequisites:
-#   - RouterOS 7.22 or higher with container support (CHR, ARM, ARM64, or TILE)
+#   - RouterOS 7.22.x with container support (ARM, ARM64, x86, or CHR)
 #   - USB storage mounted at /usb1 (or modify cDefaultStorageMount variable)
 #   - Network connectivity to Docker Hub
 #
 # Post-deployment steps (first-time only):
-#   1. Configure IP address on the veth interface
-#   2. Set up firewall/NAT rules as needed
+#   1. Attach the veth interface to a container bridge
+#   2. Assign 172.17.0.1/24 to that bridge and configure NAT/firewall rules
 #   3. Access AdGuard Home web UI (default: http://<container-ip>:3000)
 #   4. Complete initial AdGuard Home setup wizard
 #
@@ -54,18 +54,22 @@
 :local cMountListName "agh_conf"
 :local cMountSrc ($cDefaultStorageMount . "/conf/agh")
 :local cMountDst "/opt/adguardhome/conf"
+:local cWorkMountSrc ($cDefaultStorageMount . "/work/agh")
+:local cWorkMountDst "/opt/adguardhome/work"
 :local cEnvListName "AGH"
 :local cRegistryUrl "https://registry-1.docker.io"
+:local cRegistryHost "registry-1.docker.io"
+:local cContainerAddress "172.17.0.2/24"
+:local cContainerGateway "172.17.0.1"
 :local cRequiredMinorVersion "22"
-:local cScriptVersion "1.6.1"
+:local cScriptVersion "1.7.0"
 
 ## Timeout configuration (adjust for slow USB/large images)
 :local cPullTimeout 300
-:local cStartDelay 10
+:local cPollInterval 5s
+:local cPollSeconds 5
+:local cStartDelay 5s
 :local cVerifyDelay 10
-
-## DNS backup for restoration
-:local dnsBackup ""
 
 ## Progress tracking
 :local milestoneNum 0
@@ -140,6 +144,22 @@
 :set milestoneNum ($milestoneNum + 1)
 :put ("[" . $milestoneNum . "/" . $milestoneTotal . "] Pre-flight Checks...")
 
+## Container package verification
+:put "      |-- Container package..."
+:local packageOk false
+:local packageIds [/system package find where name="container"]
+:local enabledPackageIds [/system package find where name="container" and disabled=no]
+:if ([:len $enabledPackageIds] > 0) do={
+    :set packageOk true
+    :put "      |   |-- [OK] Installed and enabled"
+} else={
+    :if ([:len $packageIds] > 0) do={
+        :put "      |   |-- [FAILED] Package is disabled"
+    } else={
+        :put "      |   |-- [FAILED] Package is not installed"
+    }
+}
+
 ## Storage mount verification
 :put "      |-- Storage mount..."
 :local storageOk false
@@ -161,7 +181,7 @@
 
 ## Also check /file as fallback
 :if ($storageOk = false) do={
-    :local storageFound [/file find where name=$cDefaultStorageMount]
+    :local storageFound [/file find where name=$diskName]
     :if ([:len $storageFound] > 0) do={
         :set storageOk true
         :put ("      |   |-- [OK] " . $cDefaultStorageMount . " verified")
@@ -180,7 +200,7 @@
             :put ("      |   |--   /" . $mp)
         }
     }
-    :put "      |   |-- Fix: Edit cDefaultStorageMount at line 45"
+    :put "      |   |-- Fix: Edit cDefaultStorageMount near the top of this script"
     :set deploymentSuccess false
 }
 
@@ -195,24 +215,32 @@
 :put "      |-- Network connectivity..."
 :local networkOk false
 :do {
-    ## Test with DNS resolution check - simpler and reliable
-    :resolve "registry-1.docker.io"
+    :resolve $cRegistryHost
     :set networkOk true
     :put "      |   |-- [OK] Docker Hub reachable"
 } on-error={
-    :put "      |   |-- [WARN] Network test failed - will try pull anyway"
+    :put "      |   |-- [FAILED] Cannot resolve Docker Hub"
 }
 
-:if ($storageOk = true) do={
+:if ($packageOk = true && $storageOk = true && $networkOk = true) do={
     :put "      |-- [OK] Pre-flight checks passed"
 } else={
     :put "      |-- [FAILED] Pre-flight checks failed"
+    :if ($packageOk != true) do={
+        :put "      |-- [ERROR] Install and enable the container package"
+        :error "Container package unavailable"
+    }
     :if ($storageOk != true) do={
         :put "      |-- [ERROR] Storage required for container deployment"
         :put "      |-- DEBUG INFO:"
         :put ("      |   |-- storageOk=" . $storageOk)
         :put "      |   |-- Run: /disk print"
         :error "Storage not configured"
+    }
+    :if ($networkOk != true) do={
+        :put "      |-- [ERROR] Configure working DNS/network access before deployment"
+        :put "      |   |-- Run: /ip dns print"
+        :error "Docker Hub unavailable"
     }
 }
 
@@ -223,19 +251,17 @@
 :set milestoneNum ($milestoneNum + 1)
 :put ("[" . $milestoneNum . "/" . $milestoneTotal . "] Container Feature...")
 
-:local containerEnabled false
-:if ([:find [/system/device-mode print] "container: yes"] != nil) do={
-    :set containerEnabled true
-}
+:local containerEnabled [/system/device-mode get container]
 
 :if ($containerEnabled = true) do={
     :put "      |-- [OK] Already enabled"
 } else={
     :put "      |-- Enabling container feature..."
     /system/device-mode/update container=yes
-    :put "      |-- [WARN] Reboot required"
-    :put "      |-- Run script again after reboot"
-    :error "Reboot required"
+    :put "      |-- [ACTION REQUIRED] Confirm within the activation window"
+    :put "      |-- Briefly press the reset/mode button, or perform a cold power cycle"
+    :put "      |-- Run this script again after RouterOS restarts"
+    :error "Physical device-mode confirmation required"
 }
 
 ## ========================================
@@ -246,9 +272,11 @@
 :put ("[" . $milestoneNum . "/" . $milestoneTotal . "] Registry Configuration...")
 
 :local currentRegistry [/container config get registry-url]
-:if ($currentRegistry != $cRegistryUrl) do={
+:local currentTmpDir [/container config get tmpdir]
+:if ($currentRegistry != $cRegistryUrl || $currentTmpDir != $cTmpDir) do={
     /container config set registry-url=$cRegistryUrl tmpdir=$cTmpDir
-    :put ("      |-- [OK] Configured " . $cRegistryUrl)
+    :put ("      |-- [OK] Registry: " . $cRegistryUrl)
+    :put ("      |-- [OK] Temp directory: " . $cTmpDir)
 } else={
     :put "      |-- [OK] Already configured"
 }
@@ -260,12 +288,66 @@
 :set milestoneNum ($milestoneNum + 1)
 :put ("[" . $milestoneNum . "/" . $milestoneTotal . "] Mount Points...")
 
-:local mountExists [:len [/container mounts find list=$cMountListName]]
-:if ($mountExists = 0) do={
+:local mountFound false
+:local mountMatches false
+:foreach mountId in=[/container mounts find where list=$cMountListName] do={
+    :local existingDst [/container mounts get $mountId dst]
+    :if ($existingDst = $cMountDst) do={
+        :set mountFound true
+        :local existingSrc [/container mounts get $mountId src]
+        :if ($existingSrc = $cMountSrc) do={
+            :set mountMatches true
+        }
+    }
+}
+
+:if ($mountFound = false) do={
     /container mounts add list=$cMountListName src=$cMountSrc dst=$cMountDst
     :put ("      |-- [OK] Created mount '" . $cMountListName . "'")
 } else={
-    :put ("      |-- [OK] Mount '" . $cMountListName . "' exists")
+    :if ($mountMatches = true) do={
+        :put ("      |-- [OK] Mount '" . $cMountListName . "' verified")
+    } else={
+        :put ("      |-- [FAILED] Mount destination uses a different source")
+        :put ("      |-- Expected: " . $cMountSrc . " -> " . $cMountDst)
+        :put "      |-- Refusing to switch configuration storage automatically"
+        :error "Mount configuration mismatch"
+    }
+}
+
+## AdGuard Home exposes a second volume for runtime data. Add it automatically
+## on new deployments, but do not mask an existing container's work directory.
+:local workMountFound false
+:local workMountMatches false
+:foreach mountId in=[/container mounts find where list=$cMountListName] do={
+    :local existingDst [/container mounts get $mountId dst]
+    :if ($existingDst = $cWorkMountDst) do={
+        :set workMountFound true
+        :local existingSrc [/container mounts get $mountId src]
+        :if ($existingSrc = $cWorkMountSrc) do={
+            :set workMountMatches true
+        }
+    }
+}
+
+:if ($workMountFound = false) do={
+    :if ([:len [/container find name=$cName]] = 0) do={
+        /container mounts add list=$cMountListName src=$cWorkMountSrc dst=$cWorkMountDst
+        :put "      |-- [OK] Created persistent work-data mount"
+    } else={
+        :put "      |-- [FAILED] Existing container has no separate work-data mount"
+        :put "      |-- Back up and migrate /opt/adguardhome/work manually"
+        :put "      |-- Refusing to repull until runtime data is protected"
+        :error "Work-data mount migration required"
+    }
+} else={
+    :if ($workMountMatches = true) do={
+        :put "      |-- [OK] Work-data mount verified"
+    } else={
+        :put "      |-- [FAILED] Work-data destination uses a different source"
+        :put ("      |-- Expected: " . $cWorkMountSrc . " -> " . $cWorkMountDst)
+        :error "Work-data mount configuration mismatch"
+    }
 }
 
 ## ========================================
@@ -275,12 +357,18 @@
 :set milestoneNum ($milestoneNum + 1)
 :put ("[" . $milestoneNum . "/" . $milestoneTotal . "] Environment Variables...")
 
-:local envExists [:len [/container envs find list=$cEnvListName]]
-:if ($envExists = 0) do={
+:local envId [/container envs find where list=$cEnvListName and key="QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING"]
+:if ([:len $envId] = 0) do={
     /container envs add list=$cEnvListName key=QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING value=true
-    :put ("      |-- [OK] Created envlist '" . $cEnvListName . "'")
+    :put ("      |-- [OK] Added QUIC warning override")
 } else={
-    :put ("      |-- [OK] Envlist '" . $cEnvListName . "' exists")
+    :local envValue [/container envs get $envId value]
+    :if ($envValue != "true") do={
+        /container envs set $envId value=true
+        :put "      |-- [OK] Corrected QUIC warning override"
+    } else={
+        :put ("      |-- [OK] Envlist '" . $cEnvListName . "' verified")
+    }
 }
 
 ## ========================================
@@ -292,11 +380,27 @@
 
 :local vethExists [:len [/interface veth find name=$cInterface]]
 :if ($vethExists = 0) do={
-    /interface veth add name=$cInterface
+    /interface veth add name=$cInterface address=$cContainerAddress gateway=$cContainerGateway
     :put ("      |-- [OK] Created veth '" . $cInterface . "'")
-    :put "      |-- [WARN] Configure IP address manually"
+    :put ("      |-- [OK] Container address: " . $cContainerAddress)
+    :put ("      |-- [OK] Container gateway: " . $cContainerGateway)
+    :put "      |-- [ACTION REQUIRED] Attach veth to a bridge and configure NAT"
 } else={
-    :put ("      |-- [OK] Veth '" . $cInterface . "' exists")
+    :local vethId [/interface veth find name=$cInterface]
+    :local currentAddress [/interface veth get $vethId address]
+    :local currentGateway [/interface veth get $vethId gateway]
+
+    :if ([:len $currentAddress] = 0 && [:len $currentGateway] = 0) do={
+        /interface veth set $vethId address=$cContainerAddress gateway=$cContainerGateway
+        :put ("      |-- [OK] Completed address configuration on '" . $cInterface . "'")
+    } else={
+        :put ("      |-- [OK] Veth '" . $cInterface . "' exists")
+        :if ($currentAddress != $cContainerAddress || $currentGateway != $cContainerGateway) do={
+            :put "      |-- [INFO] Preserving custom veth network settings"
+            :put ("      |   |-- Address: " . $currentAddress)
+            :put ("      |   |-- Gateway: " . $currentGateway)
+        }
+    }
 }
 
 ## ========================================
@@ -316,35 +420,35 @@
     :put "      |-- Mode: Upgrade (repull)"
     :put ("      |-- Image: " . $cImage)
 
-    ## Configure DNS for reliable container pull
-    :put "      |-- Configuring DNS for pull..."
-    :set dnsBackup [/ip dns get servers]
-    /ip dns set servers=1.1.1.1,8.8.8.8
-    :put "      |   |-- [OK] Temporary DNS: 1.1.1.1, 8.8.8.8"
-
     :put "      |-- Triggering repull..."
 
-    ## Save original state for rollback
-    :local originalRunning false
-    :local cDataOrig [/container print as-value where name=$cName]
-    :if ([:len $cDataOrig] > 0) do={
-        :local firstItemOrig ($cDataOrig->0)
-        :foreach k,v in=$firstItemOrig do={
-            :if ($k = "running") do={ :set originalRunning $v }
-        }
+    :local repullStarted false
+    :do {
+        /container repull [find name=$cName] remote-image=$cImage
+        :set repullStarted true
+    } on-error={
+        :put "      |   |-- [FAILED] RouterOS rejected the repull request"
+        :put "      |   |-- Check free disk space and /container/log"
+        :set deploymentSuccess false
     }
 
-    /container repull [find name=$cName]
+    :if ($repullStarted = false) do={
+        :error "Container repull failed"
+    }
 
-    ## Wait for repull with percentage progress
+    ## Wait until automatic stop/repull/start reaches a terminal state
     :local repullTimeout $cPullTimeout
     :local repullCounter 0
     :local isExtracting true
-    :local progressPercent 0
+    :local isStopped false
+    :local repullDone false
 
     :do {
-        :delay 10s
-        :set repullCounter ($repullCounter + 10)
+        :delay $cPollInterval
+        :set repullCounter ($repullCounter + $cPollSeconds)
+        :set isExtracting false
+        :set isStopped false
+        :set deployOk false
 
         :local cData [/container print as-value where name=$cName]
         :if ([:len $cData] > 0) do={
@@ -352,32 +456,24 @@
             :foreach k,v in=$firstItem do={
                 :if ($k = "extracting") do={ :set isExtracting $v }
                 :if ($k = "running") do={ :set deployOk $v }
+                :if ($k = "stopped") do={ :set isStopped $v }
             }
         }
 
-        ## Show percentage progress
-        :set progressPercent ($repullCounter * 100 / $repullTimeout)
-        :if ($progressPercent > 100) do={ :set progressPercent 100 }
-        :put ("      |   |-- Progress: " . $progressPercent . "%")
-    } while=($isExtracting = true && $repullCounter < $repullTimeout)
+        :if ($deployOk = true || $isStopped = true) do={
+            :set repullDone true
+        }
+        :put ("      |   |-- Waiting: " . $repullCounter . "s / " . $repullTimeout . "s")
+    } while=($repullDone = false && $repullCounter < $repullTimeout)
 
     :if ($deployOk = true) do={
         :put ("      |   |-- [OK] Repull completed in " . $repullCounter . "s")
     } else={
         ## Try to start if stopped
-        :local isStopped false
-        :local cData [/container print as-value where name=$cName]
-        :if ([:len $cData] > 0) do={
-            :local firstItem ($cData->0)
-            :foreach k,v in=$firstItem do={
-                :if ($k = "stopped") do={ :set isStopped $v }
-            }
-        }
-
         :if ($isStopped = true) do={
             :put "      |   |-- Starting container..."
             /container start [find name=$cName]
-            :delay 10s
+            :delay $cStartDelay
 
             :local cData [/container print as-value where name=$cName]
             :if ([:len $cData] > 0) do={
@@ -404,15 +500,15 @@
                 :set deploymentSuccess false
             }
         } else={
-            :put "      |   |-- [FAILED] Repull timeout"
+            :put "      |   |-- [FAILED] Repull failed or timed out"
             :put "      |   |-- DEBUG INFO:"
             :put ("      |   |-- repullCounter=" . $repullCounter . "s")
             :put ("      |   |-- repullTimeout=" . $repullTimeout . "s")
             :put ("      |   |-- isExtracting=" . $isExtracting)
             :put "      |   |-- Run: /container print detail"
 
-            ## ROLLBACK: Try to restore original state
-            :put "      |   |-- Attempting rollback..."
+            ## Ask RouterOS to start the current container state if possible
+            :put "      |   |-- Attempting recovery..."
             :do {
                 :delay 5s
                 :local cData [/container print as-value where name=$cName]
@@ -424,12 +520,12 @@
                     }
                     :if ($rollbackStopped = true) do={
                         /container start [find name=$cName]
-                        :delay 10s
-                        :put "      |   |-- [ROLLBACK] Container restored to previous state"
+                        :delay $cStartDelay
+                        :put "      |   |-- [RECOVERY] Container started"
                     }
                 }
             } on-error={
-                :put "      |   |-- [ROLLBACK FAILED] Manual intervention required"
+                :put "      |   |-- [RECOVERY FAILED] Manual intervention required"
             }
             :set deploymentSuccess false
         }
@@ -438,31 +534,38 @@
     :put "      |-- Mode: First-time deployment"
     :put ("      |-- Image: " . $cImage)
 
-    ## Configure DNS for reliable container pull
-    :put "      |-- Configuring DNS for pull..."
-    :set dnsBackup [/ip dns get servers]
-    /ip dns set servers=1.1.1.1,8.8.8.8
-    :put "      |   |-- [OK] Temporary DNS: 1.1.1.1, 8.8.8.8"
-
     :put "      |-- Pulling image..."
 
-    /container add remote-image=$cImage name=$cName \
-        interface=$cInterface logging=yes mountlists=$cMountListName start-on-boot=yes \
-        root-dir=$cRootDir workdir="/opt/adguardhome/work" \
-        cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
-        entrypoint=/opt/adguardhome/AdGuardHome \
-        envlist=$cEnvListName
+    :local addStarted false
+    :do {
+        /container add remote-image=$cImage check-certificate=yes name=$cName \
+            interface=$cInterface logging=yes mountlists=$cMountListName start-on-boot=yes \
+            root-dir=$cRootDir workdir="/opt/adguardhome/work" \
+            cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
+            entrypoint=/opt/adguardhome/AdGuardHome \
+            envlist=$cEnvListName
+        :set addStarted true
+    } on-error={
+        :put "      |   |-- [FAILED] RouterOS rejected the container request"
+        :put "      |   |-- Check free disk space and /container/log"
+        :set deploymentSuccess false
+    }
 
-    ## Wait for extraction with percentage progress
+    :if ($addStarted = false) do={
+        :error "Container creation failed"
+    }
+
+    ## Wait for extraction to reach the stopped state
     :local extractTimeout $cPullTimeout
     :local extractCounter 0
     :local isExtracting true
     :local isStopped false
-    :local extractPercent 0
 
     :do {
-        :delay 10s
-        :set extractCounter ($extractCounter + 10)
+        :delay $cPollInterval
+        :set extractCounter ($extractCounter + $cPollSeconds)
+        :set isExtracting false
+        :set isStopped false
 
         :local cData [/container print as-value where name=$cName]
         :if ([:len $cData] > 0) do={
@@ -473,18 +576,17 @@
             }
         }
 
-        ## Show percentage progress
-        :set extractPercent ($extractCounter * 100 / $extractTimeout)
-        :if ($extractPercent > 100) do={ :set extractPercent 100 }
-        :put ("      |   |-- Progress: " . $extractPercent . "%")
-    } while=($isExtracting = true && $extractCounter < $extractTimeout)
+        :put ("      |   |-- Waiting: " . $extractCounter . "s / " . $extractTimeout . "s")
+    } while=($isStopped = false && $extractCounter < $extractTimeout)
 
-    :put ("      |   |-- [OK] Extraction completed in " . $extractCounter . "s")
+    :if ($isStopped = true) do={
+        :put ("      |   |-- [OK] Extraction completed in " . $extractCounter . "s")
+    }
 
     :if ($isStopped = true) do={
         :put "      |-- Starting container..."
         /container start [find name=$cName]
-        :delay 5s
+        :delay $cStartDelay
 
         :local cData [/container print as-value where name=$cName]
         :if ([:len $cData] > 0) do={
@@ -511,21 +613,21 @@
             :set deploymentSuccess false
         }
     } else={
-        :put "      |-- [FAILED] Extraction timeout"
+        :put "      |-- [FAILED] Extraction failed or timed out"
         :put "      |-- DEBUG INFO:"
         :put ("      |   |-- extractCounter=" . $extractCounter . "s")
         :put ("      |   |-- extractTimeout=" . $extractTimeout . "s")
         :put ("      |   |-- isExtracting=" . $isExtracting)
         :put "      |   |-- Run: /container print detail"
 
-        ## ROLLBACK: Remove failed container (cleanup for first-time deploy)
+        ## Remove the failed first-time container so the next run can retry
         :put "      |   |-- Attempting cleanup..."
         :do {
             /container remove [find name=$cName]
-            :put "      |   |-- [ROLLBACK] Failed container removed"
+            :put "      |   |-- [CLEANUP] Failed container removed"
             :put "      |   |-- Re-run script to retry deployment"
         } on-error={
-            :put "      |   |-- [ROLLBACK FAILED] Manual cleanup required"
+            :put "      |   |-- [CLEANUP FAILED] Manual cleanup required"
             :put ("      |   |-- Run: /container remove " . $cName)
         }
         :set deploymentSuccess false
@@ -534,107 +636,64 @@
 
 ## Verification sub-step
 :put "      |-- Verification..."
-:delay 5s
+:delay $cStartDelay
 
 :local cData [/container print as-value where name=$cName]
+:local finalRunning false
 :if ([:len $cData] > 0) do={
     :local firstItem ($cData->0)
-    :local finalRunning false
-    :local finalUptime ""
-
     :foreach k,v in=$firstItem do={
         :if ($k = "running") do={ :set finalRunning $v }
-        :if ($k = "uptime") do={ :set finalUptime $v }
     }
 
-    :if ($finalRunning = true && [:len $finalUptime] > 0) do={
-        :put ("      |   |-- [OK] Running with uptime: " . $finalUptime)
+    :if ($finalRunning = true) do={
+        :put "      |   |-- [OK] Container is running"
         :set deployOk true
     } else={
-        :if ($finalRunning = true) do={
-            :put "      |   |-- [WARN] Running but no uptime"
-            :put "      |   |-- DEBUG: Container may be starting, wait and check"
-        } else={
-            :put "      |   |-- [FAILED] Not running"
-            :put "      |   |-- DEBUG INFO:"
-            :put ("      |   |--   finalRunning=" . $finalRunning)
-            :put ("      |   |--   finalUptime=" . $finalUptime)
-            :put "      |   |-- Run: /container print detail"
-            :put ("      |   |-- Run: /container start " . $cName)
-            :set deploymentSuccess false
-        }
+        :put "      |   |-- [FAILED] Container is not running"
+        :put "      |   |-- Run: /container print detail"
+        :put ("      |   |-- Run: /container log " . $cName)
+        :set deployOk false
+        :set deploymentSuccess false
     }
 } else={
     :put "      |   |-- [FAILED] Container not found"
-    :put "      |   |-- DEBUG INFO:"
-    :put ("      |   |-- cName=" . $cName)
     :put "      |   |-- Run: /container print"
+    :set deployOk false
     :set deploymentSuccess false
 }
-
-:delay 5s
 
 ## Second verification pass (stability check)
 :put "      |-- Stability check..."
 :delay $cVerifyDelay
 
 :local cData2 [/container print as-value where name=$cName]
+:local finalRunning2 false
 :if ([:len $cData2] > 0) do={
     :local firstItem ($cData2->0)
-    :local finalRunning2 false
-    :local finalUptime2 ""
-
     :foreach k,v in=$firstItem do={
         :if ($k = "running") do={ :set finalRunning2 $v }
-        :if ($k = "uptime") do={ :set finalUptime2 $v }
     }
 
-    :if ($finalRunning2 = true && [:len $finalUptime2] > 0) do={
-        :put ("      |   |-- [OK] Stable - uptime: " . $finalUptime2)
+    :if ($finalRunning2 = true) do={
+        :put "      |   |-- [OK] Container remained running"
         :set deployOk true
     } else={
-        :if ($finalRunning2 = true) do={
-            :put "      |   |-- [WARN] Container starting - may need more time"
-        } else={
-            :put "      |   |-- [FAILED] Container crashed after start"
-            :put "      |   |-- DEBUG: Check container logs"
-            :set deploymentSuccess false
-        }
+        :put "      |   |-- [FAILED] Container stopped after start"
+        :put ("      |   |-- Run: /container log " . $cName)
+        :set deployOk false
+        :set deploymentSuccess false
     }
 } else={
     :put "      |   |-- [FAILED] Container disappeared"
+    :set deployOk false
     :set deploymentSuccess false
 }
 
-:if ($deployOk = true) do={
+:if ($deployOk = true && $deploymentSuccess = true) do={
     :put "      |-- [OK] Deployment completed"
-
-    ## Remove stale reverse DNS entries for container IP
-    :put "      |-- Cleaning DNS..."
-    :do {
-        /ip dns static remove [find where address=172.17.0.1]
-        :put "      |   |-- [OK] Removed stale reverse DNS (172.17.0.1)"
-    } on-error={
-        :put "      |   |-- [OK] No stale reverse DNS found"
-    }
-
-    ## Restore DNS settings
-    :put "      |-- Restoring DNS..."
-    :if ([:len $dnsBackup] > 0 && $dnsBackup != "1.1.1.1,8.8.8.8") do={
-        /ip dns set servers=$dnsBackup
-        :put ("      |   |-- [OK] DNS restored to: " . $dnsBackup)
-    } else={
-        :put "      |   |-- [INFO] DNS already configured"
-    }
 } else={
     :put "      |-- [FAILED] Deployment failed"
-
-    ## Restore DNS even on failure
-    :put "      |-- Restoring DNS..."
-    :if ([:len $dnsBackup] > 0) do={
-        /ip dns set servers=$dnsBackup
-        :put "      |   |-- [OK] DNS restored after failure"
-    }
 }
 
 ## ========================================
