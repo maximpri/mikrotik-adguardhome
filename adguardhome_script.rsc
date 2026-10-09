@@ -68,7 +68,8 @@
 
 ## RouterOS 7.23+ native healthcheck configuration. The default command covers
 ## both the first-run setup UI (port 3000) and the normal web UI (port 80).
-## Change this command if AdGuard Home uses a custom web port.
+## Change this command if AdGuard Home uses a custom web port. The command is
+## embedded in a double-quoted RouterOS string, so avoid unescaped " and $.
 :local cHealthcheckCmd "sh -c 'wget -q --spider http://127.0.0.1:3000 || wget -q --spider http://127.0.0.1:80'"
 :local cHealthcheckInterval "00:00:30"
 :local cHealthcheckTimeout "00:00:10"
@@ -121,9 +122,26 @@
     :set minorVersion [:pick $afterFirstDot 0 $secondDot]
 }
 
+## Keep only the leading digits so pre-releases such as 7.23rc1 parse as 23.
+:local minorDigits ""
+:local minorDigitsDone false
+:if ([:len $minorVersion] > 0) do={
+    :for i from=0 to=([:len $minorVersion] - 1) do={
+        :local ch [:pick $minorVersion $i]
+        :if ($minorDigitsDone = false && [:typeof [:find "0123456789" $ch]] = "num") do={
+            :set minorDigits ($minorDigits . $ch)
+        } else={
+            :set minorDigitsDone true
+        }
+    }
+}
+:if ([:len $minorDigits] = 0) do={
+    :set minorDigits "0"
+}
+
 :local versionOk false
 :local majorNumber [:tonum $majorVersion]
-:local minorNumber [:tonum $minorVersion]
+:local minorNumber [:tonum $minorDigits]
 
 ## Allow RouterOS 7.22 and every later release.
 :if ($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= $cMinimumMinorVersion)) do={
@@ -146,6 +164,25 @@
         " healthcheck-start-period=\"" . $cHealthcheckStartPeriod . "\"" . \
         " healthcheck-retries=" . $cHealthcheckRetries)
 }
+
+## Apply the healthcheck without blocking deployment. RouterOS functions do not
+## see the caller's locals, so the command is passed in as an argument.
+:local applyHealthcheck do={
+    :local configured false
+    :put "      |-- Configuring native healthcheck..."
+    :do {
+        :local setHealthcheck [:parse $command]
+        $setHealthcheck
+        :set configured true
+        :put "      |   |-- [OK] Healthcheck configured"
+    } on-error={
+        :put "      |   |-- [WARNING] RouterOS rejected the healthcheck settings"
+        :put "      |   |-- Continuing with running/stability checks only"
+        :log warning "AdGuard Home: native healthcheck configuration failed"
+    }
+    :return $configured
+}
+:local healthcheckConfigured false
 
 :if ($versionOk = true) do={
     :put ("      |-- Detected: " . $rosVersion)
@@ -456,22 +493,7 @@
 
     ## Reconcile healthchecks for containers created by earlier script versions.
     :if ($healthcheckSupported = true) do={
-        :put "      |-- Configuring native healthcheck..."
-        :local healthcheckConfigured false
-        :do {
-            :local applyHealthcheck [:parse $healthcheckSetCommand]
-            $applyHealthcheck
-            :set healthcheckConfigured true
-            :put "      |   |-- [OK] Healthcheck configured"
-        } on-error={
-            :put "      |   |-- [FAILED] RouterOS rejected the healthcheck settings"
-            :put "      |   |-- Check the container package version"
-            :set deploymentSuccess false
-        }
-
-        :if ($healthcheckConfigured = false) do={
-            :error "Healthcheck configuration failed"
-        }
+        :set healthcheckConfigured [$applyHealthcheck command=$healthcheckSetCommand]
     } else={
         :put "      |-- Native healthcheck unavailable; using stability checks"
     }
@@ -641,22 +663,7 @@
 
     :if ($isStopped = true) do={
         :if ($healthcheckSupported = true) do={
-            :put "      |-- Configuring native healthcheck..."
-            :local healthcheckConfigured false
-            :do {
-                :local applyHealthcheck [:parse $healthcheckSetCommand]
-                $applyHealthcheck
-                :set healthcheckConfigured true
-                :put "      |   |-- [OK] Healthcheck configured"
-            } on-error={
-                :put "      |   |-- [FAILED] RouterOS rejected the healthcheck settings"
-                :put "      |   |-- Check the container package version"
-                :set deploymentSuccess false
-            }
-
-            :if ($healthcheckConfigured = false) do={
-                :error "Healthcheck configuration failed"
-            }
+            :set healthcheckConfigured [$applyHealthcheck command=$healthcheckSetCommand]
         } else={
             :put "      |-- Native healthcheck unavailable; using stability checks"
         }
@@ -769,9 +776,13 @@
 
 :if ($deployOk = true && $deploymentSuccess = true) do={
     :put "      |-- [OK] Deployment completed"
-    :if ($healthcheckSupported = true) do={
-        :put "      |-- Native healthcheck is starting (up to 2 minutes grace)"
+    :if ($healthcheckConfigured = true) do={
+        :put ("      |-- Native healthcheck is starting (start period " . $cHealthcheckStartPeriod . ")")
         :put "      |-- Run: /container print proplist=name,healthcheck-status"
+    } else={
+        :if ($healthcheckSupported = true) do={
+            :put "      |-- [WARNING] Native healthcheck not configured"
+        }
     }
 } else={
     :put "      |-- [FAILED] Deployment failed"

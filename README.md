@@ -87,7 +87,9 @@ Inspect the native status on RouterOS 7.23 or later:
 /container print proplist=name,healthcheck-status
 ```
 
-Running the deployment script again reconciles the healthcheck on containers created by earlier script versions.
+Running the deployment script again reconciles the healthcheck on containers created by earlier script versions. If RouterOS rejects the healthcheck settings, the script prints a warning and continues the deployment with its running and stability checks.
+
+The container is created with `logging=yes`, and RouterOS may record each probe in the container log. If that log is written to flash or USB storage, consider a longer `cHealthcheckInterval`.
 
 ## Complete the network setup
 
