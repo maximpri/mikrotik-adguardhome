@@ -7,7 +7,7 @@ A RouterOS script that installs, upgrades, or switches between [AdGuard Home](ht
 Paste this into the RouterOS terminal:
 
 ```routeros
-:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
+:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
 ```
 
 It sets up two RouterOS scripts, `mikrotik-adguardhome` and `mikrotik-adguardhome-settings`, then installs AdGuard Home, or upgrades whichever app is already installed. From then on, the whole command is:
@@ -22,10 +22,8 @@ For **Pi-hole**, run `:global AghApp "pihole"` first, or set `app` in the settin
 
 1. It rewrites `/system script mikrotik-adguardhome` as a two-line stub that downloads and runs the latest loader. An old, broken, or hand-made copy is replaced. The stub's comment, which records the deployed image, is kept.
 2. It reads your settings from `/system script mikrotik-adguardhome-settings`. On first use it creates that script, carrying over values from an earlier loader that kept settings in its own source.
-3. It resolves the branch to one commit, so every piece comes from the same version and no stale cached copy is used.
-4. It downloads `adguardhome_script.rsc` in 60 KB ranges, so the deployment script isn't limited by the 63 KiB that a single `/tool fetch` can hold in memory.
-5. It checks the end-of-file marker. The deployment script is a single block, so a truncated download fails to parse and nothing runs.
-6. It runs the deployment script with your settings.
+3. It downloads the version tagged `latest`. When GitHub reports which commit the tag points to, it pins the download to that commit, so no stale cached copy is used.
+4. It downloads `adguardhome_script.rsc` to a temporary file, which has no size limit, imports it with your settings, and deletes the file. The deployment script is a single block, so a truncated download fails to parse and nothing runs.
 
 If anything fails or is rolled back, the run ends with an error and shows the reason in its summary.
 
@@ -34,7 +32,7 @@ If anything fails or is rolled back, the run ends with an error and shows the re
 Prefer to review the script first? Download it, edit the settings at the top, and import it:
 
 ```routeros
-/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc"
+/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/adguardhome_script.rsc"
 /import adguardhome_script.rsc
 ```
 
@@ -197,6 +195,15 @@ Then run the script again. Settings, users, rules, and filter lists in `AdGuardH
 ## Development
 
 `tools/lint_rsc.py` runs in CI on both scripts. It checks that each is a single `{ }` block ending with the end-of-file marker, that delimiters balance, that every variable is declared, and that the loader stays small enough for a single in-memory fetch.
+
+### Publishing a version
+
+Routers run whatever the `latest` tag points to, so a push to `main` reaches no router until it is published. To publish, run the **Publish latest** workflow (Actions → Publish latest → Run workflow) with the commit or branch to release. It lints both scripts, then moves the `latest` tag. From a checkout, the equivalent is:
+
+```sh
+git tag -f latest <commit>
+git push -f origin latest
+```
 
 ## Security notes
 

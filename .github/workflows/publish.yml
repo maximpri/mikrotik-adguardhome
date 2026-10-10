@@ -1,0 +1,28 @@
+name: Publish latest
+
+# Routers run the version the "latest" tag points to. This moves the tag to
+# a chosen commit after the scripts pass lint.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch, or tag to publish as latest
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - run: python3 tools/lint_rsc.py mikrotik-adguardhome.rsc 20000
+      - run: python3 tools/lint_rsc.py adguardhome_script.rsc 1000000
+      - run: |
+          git tag -f latest HEAD
+          git push -f origin latest

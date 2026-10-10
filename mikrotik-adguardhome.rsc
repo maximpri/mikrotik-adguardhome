@@ -2,7 +2,7 @@
 # mikrotik-adguardhome loader: AdGuard Home / Pi-hole for MikroTik RouterOS
 # ============================================================================
 # Install and run (RouterOS terminal):
-#   :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
+#   :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
 # Afterwards:
 #   /system script run mikrotik-adguardhome
 #
@@ -12,19 +12,20 @@
 #   2. Reads settings from /system script mikrotik-adguardhome-settings,
 #      creating it on first use (and carrying over settings from earlier
 #      versions of the loader).
-#   3. Downloads adguardhome_script.rsc pinned to one commit, in ranges,
-#      verifies it is complete, and runs it with those settings.
+#   3. Downloads adguardhome_script.rsc, pinned to one commit when GitHub
+#      can resolve it, to a temporary file and imports it with those
+#      settings. The script is one { } block, so a truncated download fails
+#      to parse and nothing runs.
 # ============================================================================
 {
 
 :local repo "maximpri/mikrotik-adguardhome"
-:local ref "agent/safe-upgrade-pihole"
+## Git tag (or branch) to run. "latest" is moved to each published version.
+:local ref "latest"
 :local file "adguardhome_script.rsc"
 :local name "mikrotik-adguardhome"
 :local settingsName ($name . "-settings")
-:local chunk 60000
-## Built from two parts so that only a file's last line contains it.
-:local marker ("#SCRIPT-" . "COMPLETE")
+:local tmpFile ($name . "-download.rsc")
 
 ## Default settings; the settings script overrides them.
 :local keys {"app";"storage";"configStorage";"address";"gateway";"fallbackDns";"piholePassword";"adguardImage";"piholeImage"}
@@ -127,56 +128,51 @@
 }
 :do { /system script environment remove [find where name="AghSettings"] } on-error={ }
 
-## 3. Pin the download to one commit, so all ranges come from the same
-##    version and no stale cached copy is used.
+## 3. Pin the download to one commit, so no stale cached copy is used. Plain
+##    request: RouterOS fetch may reject custom headers or partial responses.
 :local commit $ref
 :do {
     :local r ([/tool fetch output=user as-value url=("https://api.github.com/repos/" . $repo . \
-        "/commits/" . $ref) http-header-field="User-Agent: RouterOS,Accept: application/vnd.github.sha"]->"data")
-    :if ([:len $r] = 40) do={ :set commit $r }
-} on-error={
-    :put ("  [INFO] Could not resolve '" . $ref . "' to a commit; using the branch")
+        "/commits/" . $ref)]->"data")
+    :local p [:find $r "\"sha\":\""]
+    :if ([:typeof $p] = "num") do={
+        :local c [:pick $r ($p + 7) ($p + 47)]
+        :if ([:len $c] = 40) do={ :set commit $c }
+    }
+} on-error={ }
+:if ($commit = $ref) do={
+    :put ("  [INFO] Using '" . $ref . "' (GitHub did not report its commit)")
 }
 :local url ("https://raw.githubusercontent.com/" . $repo . "/" . $commit . "/" . $file)
 
-## A single fetch holds at most 63 KiB, so download in ranges.
-:local code ""
-:local offset 0
-:local more true
-:while ($more = true) do={
-    :local part ""
-    :local got false
-    :do {
-        :set part ([/tool fetch output=user as-value url=$url \
-            http-header-field=("Range: bytes=" . $offset . "-" . ($offset + $chunk - 1))]->"data")
-        :set got true
-    } on-error={ }
-    :if ($got = false) do={
-        ## A range past the end of the file is refused: the download is done.
-        :if ($offset = 0) do={ :error ("mikrotik-adguardhome: cannot download " . $file) }
-        :set more false
-    } else={
-        :if ([:len $part] > $chunk) do={
-            ## The server sent the whole file instead of a range.
-            :set code $part
-            :set more false
-        } else={
-            :set code ($code . $part)
-            :set offset ($offset + $chunk)
-            :if ([:len $part] < $chunk || $offset > 2000000) do={ :set more false }
-        }
-    }
+## Download to a file (a single in-memory fetch holds at most 63 KiB).
+:do { /file remove [find where name=$tmpFile] } on-error={ }
+:local fetched false
+:do {
+    /tool fetch url=$url dst-path=$tmpFile
+    :set fetched true
+} on-error={ }
+:delay 1s
+:local fileIds [/file find where name=$tmpFile]
+:if ($fetched = false || [:len $fileIds] = 0) do={
+    :do { /file remove [find where name=$tmpFile] } on-error={ }
+    :error ("mikrotik-adguardhome: cannot download " . $url)
 }
-:if ([:typeof [:find $code $marker]] != "num") do={
-    :error "mikrotik-adguardhome: download incomplete; nothing was changed"
-}
-:put ("  [OK] " . $file . " @ " . [:pick $commit 0 12] . " (" . [:len $code] . " bytes)")
+:put ("  [OK] " . $file . " @ " . [:pick $commit 0 12] . " (" . [/file get ($fileIds->0) size] . " bytes)")
 
-## Run the deployment script with the settings.
+## Run the deployment script with the settings, then remove the download.
 :set ($settings->"updater") $name
 :global AghOptions $settings
-:local main [:parse $code]
-$main
+:local failed false
+:do {
+    /import file-name=$tmpFile verbose=no
+} on-error={
+    :set failed true
+}
+:do { /file remove [find where name=$tmpFile] } on-error={ }
+:if ($failed = true) do={
+    :error "mikrotik-adguardhome: stopped; see the summary above"
+}
 
 }
 #SCRIPT-COMPLETE
