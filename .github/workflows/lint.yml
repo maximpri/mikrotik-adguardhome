@@ -1,0 +1,13 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rsc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/lint_rsc.py mikrotik-adguardhome.rsc 20000
+      - run: python3 tools/lint_rsc.py adguardhome_script.rsc 1000000
