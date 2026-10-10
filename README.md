@@ -16,7 +16,7 @@ An idempotent RouterOS script that deploys and upgrades [AdGuard Home](https://a
 
 - RouterOS **7.22.x**. The script intentionally rejects other releases because its repull workflow is specific to 7.22 and has not been tested on later versions.
 - The RouterOS `container` package, installed and enabled.
-- An ARM, ARM64, x86, or CHR system supported by the container package.
+- An ARM, ARM64, x86, or CHR system supported by the container package. EN7562CT devices such as the hEX Refresh (E50UG) are not supported: RouterOS runs only arm32v5 images on them, and the official `adguard/adguardhome` image does not include an arm32v5 variant.
 - External storage mounted at `/usb1`, or a customized storage path.
 - Working router DNS and internet access to Docker Hub.
 - Physical access if container device-mode is not already enabled.
@@ -50,6 +50,7 @@ Edit the variables near the top of `adguardhome_script.rsc` before importing it:
 :local cImage "adguard/adguardhome:latest"
 :local cInterface "agh"
 :local cDefaultStorageMount "/usb1"
+:local cConfigStorageMount $cDefaultStorageMount
 :local cContainerAddress "172.17.0.2/24"
 :local cContainerGateway "172.17.0.1"
 :local cPullTimeout 300
@@ -65,6 +66,8 @@ Derived defaults are:
 | Configuration in container | `/opt/adguardhome/conf` |
 | Persistent work data | `/usb1/work/agh` |
 | Work data in container | `/opt/adguardhome/work` |
+
+`cConfigStorageMount` holds only the persistent configuration mount and defaults to `cDefaultStorageMount`. Point it at persistent storage, such as internal flash, if you put the container root and work data on non-persistent storage like a RAM disk. `AdGuardHome.yaml` is small and rarely written.
 
 `latest` is convenient for automatic upgrades but is mutable. Set `cImage` to a specific AdGuard Home tag if you need repeatable deployments.
 
