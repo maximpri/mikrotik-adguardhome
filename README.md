@@ -4,26 +4,27 @@ A RouterOS script that installs, upgrades, or switches between [AdGuard Home](ht
 
 ## Quick start
 
-Paste one line into the RouterOS terminal.
-
-**AdGuard Home**, or whichever app is already installed:
+Paste this into the RouterOS terminal:
 
 ```routeros
-:do {:local r [/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc" output=user as-value]; :if ([:typeof [:find ($r->"data") "#SCRIPT-COMPLETE"]] != "num") do={:error "download incomplete"}; :local s [:parse ($r->"data")]; $s} on-error={:put "Stopped. See the messages above."}
+:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc" output=user as-value]->"data")]; $s
 ```
 
-**Pi-hole**:
+It installs AdGuard Home, or upgrades whichever app is already installed. For **Pi-hole**, run this first:
 
 ```routeros
-:global DnsFilterApp "pihole"; :do {:local r [/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc" output=user as-value]; :if ([:typeof [:find ($r->"data") "#SCRIPT-COMPLETE"]] != "num") do={:error "download incomplete"}; :local s [:parse ($r->"data")]; $s} on-error={:put "Stopped. See the messages above."}
+:global DnsFilterApp "pihole"
 ```
 
-The line:
+After the first successful run, the script saves a short updater. Use it from then on:
 
-1. Downloads the script into memory, without writing a file to flash.
-2. Checks for the end-of-file marker, so a truncated download never runs.
-3. Parses the whole script before running any of it, so a syntax error changes nothing.
-4. Runs it. The script ends with an error, and the line prints `Stopped`, if anything failed or was rolled back.
+```routeros
+/system script run dns-filter
+```
+
+The line downloads the script into memory, without writing a file to flash. The whole script is a single block, so a truncated download fails to parse and nothing runs. If anything fails or is rolled back, the run ends with an error and shows the reason in its summary.
+
+**Backup:** before changing anything, every run saves the router configuration with `/export file=dns-filter-backup`. If the backup can't be written, the run stops without changing anything. To restore settings from the backup, review `dns-filter-backup.rsc` and import what you need. Set `cBackupFile` to `""` to skip the backup.
 
 Prefer to review the script first? Download it, edit the settings at the top, and import it:
 
@@ -126,9 +127,10 @@ Both apps use the same veth (`agh`) and address, so switching apps keeps the DNS
 
 ## Scheduled updates (optional)
 
+After the first run, schedule the saved updater:
+
 ```routeros
-/system script add name=dns-filter-update source={:do {:local r [/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc" output=user as-value]; :if ([:typeof [:find ($r->"data") "#SCRIPT-COMPLETE"]] != "num") do={:error "download incomplete"}; :local s [:parse ($r->"data")]; $s} on-error={:log warning "dns-filter-update stopped"}}
-/system scheduler add name=dns-filter-update interval=1d start-time=04:00:00 on-event="/system script run dns-filter-update"
+/system scheduler add name=dns-filter-update interval=1d start-time=04:00:00 on-event="/system script run dns-filter"
 ```
 
 Scheduled runs keep the installed app. Results are written to the RouterOS log under `DNS filter:`.
@@ -174,7 +176,7 @@ Deployments from before 1.7.0 may lack the work-data mount. The script stops rat
 /log print where message~"DNS filter"
 ```
 
-- **`download incomplete` or a fetch error:** check router DNS and internet access with `:put [:resolve raw.githubusercontent.com]`. If certificate validation fails because of the CRL, add `check-certificate=yes-without-crl` to the fetch command.
+- **`syntax error` or a fetch error:** check router DNS and internet access with `:put [:resolve raw.githubusercontent.com]`. If certificate validation fails because of the CRL, add `check-certificate=yes-without-crl` to the fetch command.
 - **`Router DNS: fallback active` in the summary:** the container is not answering yet. Run the script again once it answers, or run `/system script run dns-filter-restore`.
 - **`Another run is in progress`:** a previous run was interrupted. Clear the lock with `:set DnsFilterLock ""`.
 - **Slow image pulls:** increase `cPullTimeout`.
@@ -182,7 +184,7 @@ Deployments from before 1.7.0 may lack the work-data mount. The script stops rat
 
 ## Development
 
-`tools/lint_rsc.py` runs in CI. It checks that the script stays under 60 KB (the one-liner's in-memory limit is 63 KiB), that the end-of-file marker is the last line, that delimiters balance, and that every variable is declared.
+`tools/lint_rsc.py` runs in CI. It checks that the script stays under 60 KB (the in-memory download limit is 63 KiB), that it is a single `{ }` block ending with the end-of-file marker, that delimiters balance, and that every variable is declared.
 
 ## Security notes
 

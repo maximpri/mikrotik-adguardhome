@@ -16,15 +16,23 @@
 #     server is used during the switch and the original settings are restored
 #     once the container answers again.
 #
-# Choose the app with cApp below, or before running:  :global DnsFilterApp "pihole"
-# For the one-line installer, see README.md. It loads this file into memory,
-# so keep the file under 60 KB.
+# Run it from the RouterOS terminal (see README.md):
+#   :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc" output=user as-value]->"data")]; $s
+# After the first successful run:  /system script run dns-filter
+# Choose Pi-hole first with:       :global DnsFilterApp "pihole"
+#
+# Before changing anything, each run saves /export file=dns-filter-backup.
+#
+# The whole script is one { } block, so a truncated download fails to parse
+# and nothing runs. The in-memory download limit is 63 KiB; stay under 60 KB.
 #
 # Prerequisites:
 #   - RouterOS 7.22 or later with the container package (ARM, ARM64, x86, CHR)
 #   - Storage mounted at /usb1 (or change cDefaultStorageMount)
 #   - Not supported: EN7562CT devices (hEX Refresh) run only arm32v5 images
 # ============================================================================
+
+{
 
 ## ========================================
 ## Settings
@@ -47,6 +55,13 @@
 :local cContainerGateway "172.17.0.1"
 :local cRegistryUrl "https://registry-1.docker.io"
 :local cRegistryHost "registry-1.docker.io"
+
+## Configuration export saved before any change ("" disables)
+:local cBackupFile "dns-filter-backup"
+## Short updater saved after a successful run ("" disables):
+##   /system script run dns-filter
+:local cUpdaterName "dns-filter"
+:local cScriptUrl "https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc"
 :local cTmpDir ($cDefaultStorageMount . "/tmp")
 
 ## Fallback resolvers used while the router's DNS server is switching
@@ -75,7 +90,7 @@
 
 :local cScriptVersion "2.0.0"
 :local stepNum 0
-:local stepTotal 9
+:local stepTotal 10
 :local currentStep ""
 :local deploymentSuccess true
 :local failReason ""
@@ -87,7 +102,7 @@
 ## Container that serves DNS right now; updated only after a verified switch.
 :local servingName ""
 
-## App profile (filled in step 2)
+## App profile (filled in step 3)
 :local appId ""
 :local appTitle ""
 :local appBase ""
@@ -439,14 +454,36 @@
 }
 
 ## ========================================
-## Steps 2-9
+## Steps 2-10
 ## ========================================
 ## Every failure sets failReason and raises an error, caught at the end of
 ## this block so the router DNS is always restored.
 
 :do {
 
-    ## ---------- Step 2: Container support and app ----------
+    ## ---------- Step 2: Backup ----------
+    :set stepNum ($stepNum + 1)
+    :set currentStep "Backup"
+    :put ("[" . $stepNum . "/" . $stepTotal . "] Configuration backup...")
+    :if ([:len $cBackupFile] > 0) do={
+        :local backupOk false
+        :do {
+            /export file=$cBackupFile
+            :set backupOk true
+        } on-error={ }
+        :delay 2s
+        :if ($backupOk = false || [:len [/file find where name=($cBackupFile . ".rsc")]] = 0) do={
+            :put ("      |-- [FAILED] Could not write " . $cBackupFile . ".rsc; nothing was changed")
+            :put "      |-- Check free space with /system resource print, or set cBackupFile \"\""
+            :set failReason "Configuration backup failed"
+            :error $failReason
+        }
+        :put ("      |-- [OK] Saved " . $cBackupFile . ".rsc (restore: /import " . $cBackupFile . ".rsc)")
+    } else={
+        :put "      |-- [SKIPPED] cBackupFile is empty"
+    }
+
+    ## ---------- Step 3: Container support and app ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Container support"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Container support and app...")
@@ -558,7 +595,7 @@
         }
     }
 
-    ## ---------- Step 3: Storage ----------
+    ## ---------- Step 4: Storage ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Storage"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Storage...")
@@ -584,7 +621,7 @@
     :put ("      |-- [OK] " . $cDefaultStorageMount . " is mounted")
     :put ("      |-- Config: " . $appConfSrc)
 
-    ## ---------- Step 4: Router DNS ----------
+    ## ---------- Step 5: Router DNS ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Router DNS"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Router DNS and Docker Hub access...")
@@ -706,7 +743,7 @@
     }
     :put "      |-- [OK] Docker Hub resolves"
 
-    ## ---------- Step 5: Registry ----------
+    ## ---------- Step 6: Registry ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Registry configuration"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Registry configuration...")
@@ -719,7 +756,7 @@
         :put "      |-- [OK] Already configured"
     }
 
-    ## ---------- Step 6: Mounts ----------
+    ## ---------- Step 7: Mounts ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Mount points"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Mount points...")
@@ -773,7 +810,7 @@
         }
     }
 
-    ## ---------- Step 7: Environment ----------
+    ## ---------- Step 8: Environment ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Environment variables"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Environment variables...")
@@ -827,7 +864,7 @@
     }
     :put ("      |-- [OK] Envlist '" . $appEnvList . "' verified")
 
-    ## ---------- Step 8: Veth ----------
+    ## ---------- Step 9: Veth ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Network interface"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Network interface...")
@@ -851,7 +888,7 @@
         :set warningCount ($warningCount + 1)
     }
 
-    ## ---------- Step 9: Deploy ----------
+    ## ---------- Step 10: Deploy ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Container deployment"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Container deployment...")
@@ -1247,9 +1284,28 @@
             :put ("  Web UI:      http://" . $containerIp)
         }
     }
+    ## Save a short updater so later runs are: /system script run dns-filter
+    :if ([:len $cUpdaterName] > 0 && [:len $cScriptUrl] > 0) do={
+        :local updaterSource (":local s [:parse ([/tool fetch url=\"" . $cScriptUrl . \
+            "\" output=user as-value]->\"data\")]; \$s")
+        :do {
+            :local updaterIds [/system script find where name=$cUpdaterName]
+            :if ([:len $updaterIds] = 0) do={
+                /system script add name=$cUpdaterName source=$updaterSource
+            } else={
+                :if ([/system script get ($updaterIds->0) source] != $updaterSource) do={
+                    /system script set ($updaterIds->0) source=$updaterSource
+                }
+            }
+            :put ("  Next time:   /system script run " . $cUpdaterName)
+        } on-error={ }
+    }
     :log info ("DNS filter: " . $resultText . " " . $appTitle)
 } else={
     :put "  Check:       /container print detail; /ip dns print"
+    :if ([:len $cBackupFile] > 0) do={
+        :put ("  Backup:      " . $cBackupFile . ".rsc")
+    }
     :log error ("DNS filter: " . $resultText . ": " . $failReason)
 }
 :put "========================================"
@@ -1257,5 +1313,7 @@
 
 :if ($deploymentSuccess = false) do={
     :error ($resultText . ": " . $failReason)
+}
+
 }
 #SCRIPT-COMPLETE

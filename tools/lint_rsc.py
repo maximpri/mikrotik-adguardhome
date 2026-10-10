@@ -3,6 +3,8 @@
 
 - The one-line installer loads the script with /tool fetch output=user,
   which silently truncates at 64512 bytes; keep a safety margin.
+- The whole script must be one { } block, so a truncated download fails
+  to parse instead of running partially.
 - The completeness marker must appear exactly once, as the last line.
 - Brackets, braces, parentheses, and strings must balance.
 - Every $variable must be declared (or be a known function argument).
@@ -28,6 +30,11 @@ if size > MAX_BYTES:
     errors.append(f"size {size} bytes exceeds {MAX_BYTES}")
 if text.count(MARKER) != 1 or text.rstrip().splitlines()[-1] != MARKER:
     errors.append(f"{MARKER} must appear exactly once, as the last line")
+
+# The whole script must be one { } block so a truncated download cannot parse.
+code_lines = [l.strip() for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+if not code_lines or code_lines[0] != "{" or code_lines[-1] != "}":
+    errors.append("the script must start with '{' and end with '}' (before the marker)")
 
 code, in_string = [], False
 for number, line in enumerate(text.splitlines(), 1):
