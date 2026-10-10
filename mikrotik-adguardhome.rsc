@@ -154,8 +154,8 @@
 :do { /file remove [find where name=$tmpFile] } on-error={ }
 :local fetched false
 :do {
-    /tool fetch url=$url dst-path=$tmpFile
-    :set fetched true
+    :local r [/tool fetch url=$url dst-path=$tmpFile as-value]
+    :if (($r->"status") = "finished") do={ :set fetched true }
 } on-error={ }
 :delay 1s
 :local fileIds [/file find where name=$tmpFile]

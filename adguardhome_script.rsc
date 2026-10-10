@@ -192,8 +192,10 @@
     :return $state
 }
 
-## Returns the Docker Hub digest the image tag points to, or "" if it cannot
-## be read. Used to skip the download when nothing changed.
+## Returns a Docker Hub digest for the image tag, or "" if it cannot be read.
+## It changes whenever the tag is pushed, so it is used to skip the download
+## when nothing changed. Uses the public tag API: RouterOS fetch requests with
+## custom headers (registry auth) fail on some releases.
 :local remoteDigest do={
     :local img [:tostr $image]
     :local tag "latest"
@@ -205,13 +207,8 @@
     :if ([:typeof [:find $img "/"]] != "num") do={ :set img ("library/" . $img) }
     :local digest ""
     :do {
-        :local auth ([/tool fetch output=user as-value url=("https://auth.docker.io/token?service=" . \
-            "registry.docker.io&scope=repository:" . $img . ":pull")]->"data")
-        :local t1 ([:find $auth "\"token\":\""] + 9)
-        :local token [:pick $auth $t1 [:find $auth "\"" $t1]]
-        :local body ([/tool fetch output=user as-value url=("https://registry-1.docker.io/v2/" . \
-            $img . "/manifests/" . $tag) http-header-field=("Authorization: Bearer " . $token . \
-            ",Accept: application/vnd.oci.image.index.v1+json")]->"data")
+        :local body ([/tool fetch output=user as-value url=("https://hub.docker.com/v2/repositories/" . \
+            $img . "/tags/" . $tag)]->"data")
         :local d1 [:find $body "sha256:"]
         :if ([:typeof $d1] = "num") do={ :set digest [:pick $body $d1 ($d1 + 71)] }
     } on-error={ }
@@ -335,6 +332,23 @@
         :set p [:pick $p 0 ([:len $p] - 1)]
     }
     :return $p
+}
+
+## Returns the /file name for a path: as given, with a leading slash, or any
+## file whose name ends with the path below the disk. "" if none.
+:local findFile do={
+    :local p [:tostr $path]
+    :if ([:pick $p 0 1] = "/") do={ :set p [:pick $p 1 [:len $p]] }
+    :local ids [/file find where name=$p]
+    :if ([:len $ids] = 0) do={ :set ids [/file find where name=("/" . $p)] }
+    :if ([:len $ids] = 0) do={
+        :local slash [:find $p "/"]
+        :if ([:typeof $slash] = "num") do={
+            :set ids [/file find where name~([:pick $p ($slash + 1) [:len $p]] . "\$")]
+        }
+    }
+    :if ([:len $ids] = 0) do={ :return "" }
+    :return [/file get ($ids->0) name]
 }
 
 ## Copies a small text file (under 60 KB) and verifies the copy's size.
@@ -1062,10 +1076,8 @@
         :local requireDns false
         :local dnsWait $cDnsReadyTimeout
         :local configBackup ""
-        :local confFile ([$filePath path=$appConfSrc] . "/" . $appConfigFile)
-        :local hasConfig ([:len [/file find where name=$confFile]] > 0 || \
-            [:len [/file find where name=("/" . $confFile)]] > 0 || \
-            [:len [/file find where name~("/" . $appConfigFile . "\$")]] > 0)
+        :local confFile [$findFile path=([$filePath path=$appConfSrc] . "/" . $appConfigFile)]
+        :local hasConfig ([:len $confFile] > 0)
         :if ([:len $oldName] > 0) do={
             :if ([$AghState containerName=$oldName] = "running") do={
                 :set oldAnswered [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=15]
@@ -1092,7 +1104,9 @@
                 ## Upgrades may migrate the config to a format the old version
                 ## cannot read, so keep a copy for rollback.
                 :local ok false
-                :do { :set ok [$copySmallFile src=$confFile dst=($confFile . ".rollback")] } on-error={ }
+                :if ($hasConfig = true) do={
+                    :do { :set ok [$copySmallFile src=$confFile dst=($confFile . ".rollback")] } on-error={ }
+                }
                 :if ($ok = true) do={
                     :set configBackup ($confFile . ".rollback")
                     :put ("      |-- [OK] Config backed up to " . $configBackup)
