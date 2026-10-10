@@ -1,9 +1,9 @@
 # ============================================================================
 # AdGuard Home / Pi-hole Container Deployment Script for MikroTik RouterOS
 # ============================================================================
-# Version: 2.0.0
+# Version: 2.1.0
 # Author:  Maxim Priezjev
-# Date:    October 9, 2026
+# Date:    October 10, 2026
 # Minimum RouterOS: 7.22
 #
 # Installs, upgrades, or switches between AdGuard Home and Pi-hole as a
@@ -106,7 +106,7 @@
 ## Internal state
 ## ========================================
 
-:local cScriptVersion "2.0.0"
+:local cScriptVersion "2.1.0"
 :local stepNum 0
 :local stepTotal 10
 :local currentStep ""

@@ -1,6 +1,7 @@
 # ============================================================================
 # mikrotik-adguardhome loader: AdGuard Home / Pi-hole for MikroTik RouterOS
 # ============================================================================
+# Version: 2.1.0
 # Install and run (RouterOS terminal):
 #   :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
 # Afterwards:
@@ -66,7 +67,7 @@
 }
 
 :put ""
-:put "mikrotik-adguardhome loader"
+:put "mikrotik-adguardhome loader v2.1.0"
 
 ## Clear state left by earlier loader versions.
 :do {
