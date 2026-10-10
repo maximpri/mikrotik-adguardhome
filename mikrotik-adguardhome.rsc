@@ -134,10 +134,15 @@
 :do {
     :local r ([/tool fetch output=user as-value url=("https://api.github.com/repos/" . $repo . \
         "/commits/" . $ref)]->"data")
-    :local p [:find $r "\"sha\":\""]
+    ## The value follows "sha": with or without a space.
+    :local p [:find $r "\"sha\""]
     :if ([:typeof $p] = "num") do={
-        :local c [:pick $r ($p + 7) ($p + 47)]
-        :if ([:len $c] = 40) do={ :set commit $c }
+        :local rest [:pick $r ($p + 5) ($p + 60)]
+        :local q [:find $rest "\""]
+        :if ([:typeof $q] = "num") do={
+            :local c [:pick $rest ($q + 1) ($q + 41)]
+            :if ([:len $c] = 40) do={ :set commit $c }
+        }
     }
 } on-error={ }
 :if ($commit = $ref) do={
