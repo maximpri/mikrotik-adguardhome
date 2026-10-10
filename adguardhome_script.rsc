@@ -99,6 +99,9 @@
 :local containerIp ""
 :local healthcheckSupported false
 :local healthcheckConfigured false
+## Set when this run adds the work-data mount to an existing deployment; the
+## mount is removed again if the run fails, so the old container is unchanged.
+:local workMountAdded false
 ## Container that serves DNS right now; updated only after a verified switch.
 :local servingName ""
 
@@ -791,14 +794,19 @@
     }
     :if ([:len $appWorkDst] > 0) do={
         :if ($workFound = false) do={
-            ## Never hide an existing container's work data behind an empty mount.
-            :if ([:len $liveName] > 0) do={
-                :put ("      |-- [FAILED] '" . $liveName . "' has no work-data mount")
-                :put ("      |-- Back up " . $appWorkDst . " and add a mount from " . $appWorkSrc)
-                :set failReason "Work-data mount migration required"
+            ## Older deployments keep work data (statistics, query log, filter
+            ## cache) inside the container. Moving it to storage starts it
+            ## empty, so that needs consent; the config file is kept either way.
+            :if ([:len $liveName] > 0 && $forceSwitch = false) do={
+                :put ("      |-- [STOPPED] '" . $liveName . "' keeps its statistics and query log inside")
+                :put "      |   |   the container. Moving them to storage starts them empty. Settings,"
+                :put "      |   |   users, rules and filter lists are kept. Nothing was changed."
+                :put "      |-- To proceed: :global DnsFilterForce \"yes\" and run again"
+                :set failReason "Work-data move needs consent (DnsFilterForce)"
                 :error $failReason
             }
             /container mounts add list=$appMountList src=$appWorkSrc dst=$appWorkDst
+            :if ([:len $liveName] > 0) do={ :set workMountAdded true }
             :put ("      |-- [OK] Created work-data mount " . $appWorkSrc . " -> " . $appWorkDst)
         } else={
             :if ($workMatches = false) do={
@@ -991,7 +999,8 @@
 
     ## Same app: skip the switch when the new image matches the running one.
     :local upToDate false
-    :if ([:len $liveName] > 0 && $switchingApps = false && $envChanged = false) do={
+    :if ([:len $liveName] > 0 && $switchingApps = false && $envChanged = false && \
+        $workMountAdded = false) do={
         :local oldRootFile [$filePath path=[/container get [find where name=$liveName] root-dir]]
         :local oldProbe [$fileInfo path=($oldRootFile . "/" . $appProbe)]
         :local newProbe [$fileInfo path=($newRootFile . "/" . $appProbe)]
@@ -1121,6 +1130,12 @@
                     :set warningCount ($warningCount + 1)
                 }
             }
+            :if ($workMountAdded = true) do={
+                :do {
+                    /container mounts remove [find where list=$appMountList and dst=$appWorkDst]
+                    :set workMountAdded false
+                } on-error={ }
+            }
             ## The rollback passes only the checks the old container passed before.
             :local restored [$startContainer containerName=$oldName timeout=$cStartTimeout]
             :if ($restored = true) do={
@@ -1197,6 +1212,9 @@
 
 } on-error={
     :set deploymentSuccess false
+    :if ($workMountAdded = true) do={
+        :do { /container mounts remove [find where list=$appMountList and dst=$appWorkDst] } on-error={ }
+    }
     :if ([:len $failReason] = 0) do={
         :set failReason ("Unexpected RouterOS error during: " . $currentStep)
     }

@@ -165,7 +165,13 @@ On 7.22, the script relies on its own running, stability, and DNS checks.
 
 Existing AdGuard Home deployments are upgraded in place. The first run pulls into `adguardhome-next` at `/usb1/agh-next`, switches, removes the old container, and renames the new one to `adguardhome`. Later upgrades alternate between `/usb1/agh` and `/usb1/agh-next`.
 
-Deployments from before 1.7.0 may lack the work-data mount. The script stops rather than hide existing data. Back up `/opt/adguardhome/work`, add a mount from `/usb1/work/agh`, restore the data, and run again.
+Deployments from before 1.7.0 keep AdGuard Home's work data (statistics, query log, cached filter lists, login sessions) inside the container. The upgrade replaces the container, so the script stops and asks first. To move work data to `/usb1/work/agh`, and start statistics and the query log empty, run:
+
+```routeros
+:global DnsFilterForce "yes"
+```
+
+Then run the script again. Settings, users, rules, and filter lists in `AdGuardHome.yaml` are kept. If that run fails or rolls back, the new mount is removed again, so the old container keeps its data.
 
 ## Troubleshooting
 
