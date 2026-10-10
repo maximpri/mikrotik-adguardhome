@@ -45,10 +45,12 @@ Prefer to review the script first? Download it, edit the settings at the top, an
 
 Every run ends with a summary of the result, container, address, router DNS state, healthcheck, and web UI address.
 
+**Self-healing.** Each run starts by repairing what an interrupted or failed run left behind. It removes a leftover `<name>-next` container or unused root directory, restores router DNS settings saved in `dns-filter-restore`, and removes a work-data mount that was added but never used. The script judges container state from RouterOS state flags, and from memory use on releases such as 7.24 that report no running field.
+
 ## How upgrades stay safe
 
 1. **The current container keeps serving.** The new image is pulled into a second container, `<name>-next`, with its own root directory. A slow or failed download doesn't affect DNS.
-2. **No restart without a change.** If the new image matches the running one, the copy is removed and nothing restarts. The script compares the AdGuard Home binary, or the Pi-hole FTL binary plus `/pihole.docker.tag`.
+2. **No restart without a change.** After each successful run, the script records the deployed image's size in the comment of the `dns-filter` updater script. If a newly pulled image has the same size and no setting changed, the copy is removed and nothing restarts. The first run after installing this version always switches once, because nothing is recorded yet.
 3. **The switch is verified.** The script stops the old container and starts the new one. It then checks that the new one is running, still running after `cStabilitySeconds`, and answering DNS (if the old one was).
 4. **Rollback.** If any check fails, the script stops the new container, restores the config backup, and starts the old one again. Before an upgrade it backs up the main config file (`AdGuardHome.yaml` or `pihole.toml`, up to 60 KB), because the new version may migrate it to a format the old one can't read. The old container must then pass the same checks it passed before: running, stable, and answering DNS. If it can't, the run reports `CRITICAL` and keeps both containers for inspection.
 5. **Cleanup.** After a verified switch, the old container is removed and the new one takes the usual name (`adguardhome` or `pihole`). Leftovers from an interrupted run are cleaned up on the next run.

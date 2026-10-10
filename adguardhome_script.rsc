@@ -102,6 +102,8 @@
 ## Set when this run adds the work-data mount to an existing deployment; the
 ## mount is removed again if the run fails, so the old container is unchanged.
 :local workMountAdded false
+## Image recorded for the next run's up-to-date check
+:local deployedImage ""
 ## Container that serves DNS right now; updated only after a verified switch.
 :local servingName ""
 
@@ -117,8 +119,6 @@
 :local appWorkSrc ""
 :local appWorkDst ""
 :local appEnvList ""
-:local appProbe ""
-:local appTagProbe ""
 :local appConfigFile ""
 :local appHealthcheckCmd ""
 
@@ -137,53 +137,64 @@
 ## ========================================
 ## Functions cannot see the caller's locals; all inputs are arguments.
 
-## Returns missing, error, extracting, running, stopped, or other.
-:local getContainerState do={
+## Returns missing, error, extracting, running, stopped, or other. RouterOS
+## releases report state differently (7.24 has no running field), so state
+## flags are queried first and memory use is the last resort. It is global
+## so the other helpers can call it.
+:global DnsFilterState do={
+    :if ([:len [/container find where name=$containerName]] = 0) do={ :return "missing" }
+    :local state ""
+    :foreach f in={"extracting";"stopped";"running"} do={
+        :if ([:len $state] = 0) do={
+            :do {
+                :local q [:parse (":return [:len [/container find where name=\"" . $containerName . \
+                    "\" and " . $f . "]]")]
+                :if ([$q] > 0) do={ :set state $f }
+            } on-error={ }
+        }
+    }
     :local items [/container print as-value where name=$containerName]
-    :if ([:len $items] = 0) do={ :return "missing" }
-    :local isRunning false
-    :local isStopped false
-    :local isExtracting false
     :local status ""
+    :local memory 0
     :foreach k,v in=($items->0) do={
-        :if ($k = "running") do={ :set isRunning $v }
-        :if ($k = "stopped") do={ :set isStopped $v }
-        :if ($k = "extracting") do={ :set isExtracting $v }
+        :if ([:len $state] = 0 && ($k = "extracting" || $k = "stopped" || $k = "running") && $v = true) do={
+            :set state $k
+        }
         :if ($k = "status") do={ :set status [:tostr $v] }
+        :if ($k = "memory-current") do={ :set memory [:tonum $v] }
     }
     :if ([:typeof [:find $status "error"]] = "num") do={ :return "error" }
-    :if ($isExtracting = true || $status = "extracting") do={ :return "extracting" }
-    :if ($isRunning = true || $status = "running") do={ :return "running" }
-    :if ($isStopped = true || $status = "stopped") do={ :return "stopped" }
-    :return "other"
+    :if ([:len $state] = 0 && ($status = "extracting" || $status = "stopped" || $status = "running")) do={
+        :set state $status
+    }
+    :if ([:len $state] = 0 && [:typeof $memory] = "num") do={
+        :if ($memory > 0) do={ :set state "running" }
+    }
+    :if ([:len $state] = 0) do={ :return "other" }
+    :return $state
+}
+
+## Returns a container's container-size as a string, or "".
+:local containerSize do={
+    :local size ""
+    :local items [/container print as-value where name=$containerName]
+    :if ([:len $items] > 0) do={
+        :foreach k,v in=($items->0) do={ :if ($k = "container-size") do={ :set size [:tostr $v] } }
+    }
+    :return $size
 }
 
 ## Waits until a new container finishes extracting. Returns the final state.
 :local waitForExtraction do={
+    :global DnsFilterState
     :local state "other"
     :local lastState ""
     :local elapsed 0
-    :local limit [:tonum $timeout]
-    :local step [:tonum $poll]
     :while ($state != "stopped" && $state != "running" && $state != "error" && \
-        $state != "missing" && $elapsed < $limit) do={
-        :delay [:totime ($step . "s")]
-        :set elapsed ($elapsed + $step)
-        :set state "other"
-        :local items [/container print as-value where name=$containerName]
-        :if ([:len $items] = 0) do={
-            :set state "missing"
-        } else={
-            :local status ""
-            :foreach k,v in=($items->0) do={
-                :if ($k = "extracting" && $v = true) do={ :set state "extracting" }
-                :if ($k = "stopped" && $v = true && $state = "other") do={ :set state "stopped" }
-                :if ($k = "running" && $v = true) do={ :set state "running" }
-                :if ($k = "status") do={ :set status [:tostr $v] }
-            }
-            :if ([:typeof [:find $status "error"]] = "num") do={ :set state "error" }
-            :if ($state = "other" && [:len $status] > 0) do={ :set state $status }
-        }
+        $state != "missing" && $elapsed < [:tonum $timeout]) do={
+        :delay [:totime ($poll . "s")]
+        :set elapsed ($elapsed + [:tonum $poll])
+        :set state [$DnsFilterState containerName=$containerName]
         :if ($state != $lastState || ($elapsed % [:tonum $progress]) = 0) do={
             :put ("      |   |-- " . $elapsed . "s: " . $state)
             :set lastState $state
@@ -192,66 +203,47 @@
     :return $state
 }
 
-## Starts a container and waits until it is running. A rejected request can
-## mean RouterOS is already starting it, so the state is polled either way.
+## Starts a container and waits until it is running. A container that was
+## still stopping rejects the request, so it is re-sent while stopped.
 :local startContainer do={
-    :do { /container start [find name=$containerName] } on-error={ }
-    :local started false
+    :global DnsFilterState
+    :do { /container start [find where name=$containerName] } on-error={ }
+    :local state ""
     :local waited 0
-    :while ($started = false && $waited < [:tonum $timeout]) do={
+    :while ($state != "running" && $waited < [:tonum $timeout]) do={
         :delay 2s
         :set waited ($waited + 2)
-        :local items [/container print as-value where name=$containerName]
-        :local isStopped false
-        :if ([:len $items] > 0) do={
-            :foreach k,v in=($items->0) do={
-                :if ($k = "running" && $v = true) do={ :set started true }
-                :if ($k = "status" && [:tostr $v] = "running") do={ :set started true }
-                :if ($k = "stopped" && $v = true) do={ :set isStopped true }
-                :if ($k = "status" && [:tostr $v] = "stopped") do={ :set isStopped true }
-            }
-        }
-        ## A container that was still stopping rejected the first request.
-        :if ($started = false && $isStopped = true) do={
-            :do { /container start [find name=$containerName] } on-error={ }
+        :set state [$DnsFilterState containerName=$containerName]
+        :if ($state = "stopped") do={
+            :do { /container start [find where name=$containerName] } on-error={ }
         }
     }
-    :return $started
+    :return ($state = "running")
 }
 
 ## Ranks how active a container is: 2 running, 1 starts on boot, 0 neither.
 :local appScore do={
+    :global DnsFilterState
     :if ([:len $containerName] = 0) do={ :return 0 }
-    :local items [/container print as-value where name=$containerName]
-    :if ([:len $items] = 0) do={ :return 0 }
-    :local score 0
-    :foreach k,v in=($items->0) do={
-        :if ($k = "start-on-boot" && $v = true && $score < 1) do={ :set score 1 }
-        :if ($k = "running" && $v = true) do={ :set score 2 }
-        :if ($k = "status" && [:tostr $v] = "running") do={ :set score 2 }
-    }
-    :return $score
+    :if ([$DnsFilterState containerName=$containerName] = "running") do={ :return 2 }
+    :local boot false
+    :do { :set boot [/container get [find where name=$containerName] start-on-boot] } on-error={ }
+    :if ($boot = true || $boot = "yes") do={ :return 1 }
+    :return 0
 }
 
 ## Stops a container and waits until it is stopped (or gone).
 :local stopContainer do={
-    :do { /container stop [find name=$containerName] } on-error={ }
-    :local stopped false
+    :global DnsFilterState
+    :do { /container stop [find where name=$containerName] } on-error={ }
+    :local state ""
     :local waited 0
-    :while ($stopped = false && $waited < [:tonum $timeout]) do={
+    :while ($state != "stopped" && $state != "missing" && $waited < [:tonum $timeout]) do={
         :delay 2s
         :set waited ($waited + 2)
-        :local items [/container print as-value where name=$containerName]
-        :if ([:len $items] = 0) do={
-            :set stopped true
-        } else={
-            :foreach k,v in=($items->0) do={
-                :if ($k = "stopped" && $v = true) do={ :set stopped true }
-                :if ($k = "status" && [:tostr $v] = "stopped") do={ :set stopped true }
-            }
-        }
+        :set state [$DnsFilterState containerName=$containerName]
     }
-    :return $stopped
+    :return ($state = "stopped" || $state = "missing")
 }
 
 ## Returns true once the server answers a DNS query (one try if timeout=0).
@@ -311,17 +303,10 @@
     :return $p
 }
 
-## Returns a file's size or contents as a string, or "" if it is missing.
-:local fileInfo do={
-    :local ids [/file find where name=$path]
-    :if ([:len $ids] = 0) do={ :return "" }
-    :if ($mode = "contents") do={ :return [:tostr [/file get ($ids->0) contents]] }
-    :return [:tostr [/file get ($ids->0) size]]
-}
-
 ## Copies a small text file (under 60 KB) and verifies the copy's size.
 :local copySmallFile do={
     :local ids [/file find where name=$src]
+    :if ([:len $ids] = 0) do={ :set ids [/file find where name=("/" . $src)] }
     :if ([:len $ids] = 0) do={ :return false }
     :local size [/file get ($ids->0) size]
     :if ($size > 60000) do={ :return false }
@@ -347,6 +332,7 @@
 ## Returns the live container of an app (base or base-next), or "". With
 ## both present, the running one wins, then the one that starts on boot.
 :local findLive do={
+    :global DnsFilterState
     :local candidates [:toarray ""]
     :set candidates ($candidates, $base)
     :set candidates ($candidates, ($base . "-next"))
@@ -355,19 +341,14 @@
         :if ([:len [/container find where name=$n]] > 0) do={ :set names ($names, $n) }
     }
     :if ([:len $names] = 0) do={ :return "" }
-    :if ([:len $names] = 1) do={ :return ($names->0) }
     :local chosen ""
     :foreach n in=$names do={
-        :local items [/container print as-value where name=$n]
-        :foreach k,v in=($items->0) do={
-            :if ($k = "running" && $v = true && [:len $chosen] = 0) do={ :set chosen $n }
-        }
+        :if ([:len $chosen] = 0 && [$DnsFilterState containerName=$n] = "running") do={ :set chosen $n }
     }
-    :if ([:len $chosen] > 0) do={ :return $chosen }
     :foreach n in=$names do={
-        :if ([/container get [find where name=$n] start-on-boot] = true && [:len $chosen] = 0) do={
-            :set chosen $n
-        }
+        :local boot false
+        :do { :set boot [/container get [find where name=$n] start-on-boot] } on-error={ }
+        :if ([:len $chosen] = 0 && ($boot = true || $boot = "yes")) do={ :set chosen $n }
     }
     :if ([:len $chosen] > 0) do={ :return $chosen }
     :return ($names->0)
@@ -536,7 +517,6 @@
         :set appWorkSrc ($cDefaultStorageMount . "/work/agh")
         :set appWorkDst "/opt/adguardhome/work"
         :set appEnvList "AGH"
-        :set appProbe "opt/adguardhome/AdGuardHome"
         :set appConfigFile "AdGuardHome.yaml"
         :set appHealthcheckCmd "sh -c 'wget -q --spider http://127.0.0.1:3000 || wget -q --spider http://127.0.0.1:80'"
         :set liveName $adguardLive
@@ -554,8 +534,6 @@
         :set appConfSrc ($cConfigStorageMount . "/conf/pihole")
         :set appConfDst "/etc/pihole"
         :set appEnvList "PIHOLE"
-        :set appProbe "usr/bin/pihole-FTL"
-        :set appTagProbe "pihole.docker.tag"
         :set appConfigFile "pihole.toml"
         :set appHealthcheckCmd "sh -c 'dig +short +norecurse +retry=0 @127.0.0.1 pi.hole || exit 1'"
         :set liveName $piholeLive
@@ -997,26 +975,24 @@
     }
     :put "      |   |-- [OK] Image extracted"
 
-    ## Same app: skip the switch when the new image matches the running one.
+    ## Same app: skip the switch when the pulled image matches the one
+    ## recorded at the last successful run (in the updater's comment).
     :local upToDate false
+    :local newSize [$containerSize containerName=$newName]
     :if ([:len $liveName] > 0 && $switchingApps = false && $envChanged = false && \
-        $workMountAdded = false) do={
-        :local oldRootFile [$filePath path=[/container get [find where name=$liveName] root-dir]]
-        :local oldProbe [$fileInfo path=($oldRootFile . "/" . $appProbe)]
-        :local newProbe [$fileInfo path=($newRootFile . "/" . $appProbe)]
-        :set upToDate ([:len $oldProbe] > 0 && $oldProbe = $newProbe)
-        :if ($upToDate = true && [:len $appTagProbe] > 0) do={
-            :local oldTag [$fileInfo path=($oldRootFile . "/" . $appTagProbe) mode="contents"]
-            :local newTag [$fileInfo path=($newRootFile . "/" . $appTagProbe) mode="contents"]
-            :set upToDate ([:len $oldTag] > 0 && $oldTag = $newTag)
+        $workMountAdded = false && [:len $newSize] > 0 && [:len $cUpdaterName] > 0) do={
+        :local updaterIds [/system script find where name=$cUpdaterName]
+        :if ([:len $updaterIds] > 0) do={
+            :set upToDate ([/system script get ($updaterIds->0) comment] = ($appId . " image " . $newSize))
         }
-        :if ($upToDate = true && [$getContainerState containerName=$liveName] != "running") do={
+        :if ($upToDate = true && [$DnsFilterState containerName=$liveName] != "running") do={
             ## A stopped live container is replaced even if the image is the same.
             :set upToDate false
         }
     }
 
     :if ($upToDate = true) do={
+        :set deployedImage ($appId . " image " . $newSize)
         /container remove [find where name=$newName]
         :put ("      |-- [OK] Already up to date; '" . $liveName . "' was not restarted")
         :set resultText "UP TO DATE"
@@ -1037,9 +1013,10 @@
         :local dnsWait $cDnsReadyTimeout
         :local configBackup ""
         :local confFile ([$filePath path=$appConfSrc] . "/" . $appConfigFile)
-        :local hasConfig ([:len [/file find where name=$confFile]] > 0)
+        :local hasConfig ([:len [/file find where name=$confFile]] > 0 || \
+            [:len [/file find where name=("/" . $confFile)]] > 0)
         :if ([:len $oldName] > 0) do={
-            :if ([$getContainerState containerName=$oldName] = "running") do={
+            :if ([$DnsFilterState containerName=$oldName] = "running") do={
                 :set oldAnswered [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=15]
             }
             :set requireDns $oldAnswered
@@ -1047,7 +1024,8 @@
             :if ($appId = "pihole" && $hasConfig = false) do={ :set dnsWait ($cDnsReadyTimeout * 3) }
             ## A fresh AdGuard Home answers DNS only after its setup wizard, so
             ## replacing a working resolver with it needs explicit consent.
-            :if ($appId = "adguard" && $hasConfig = false && $oldAnswered = true) do={
+            :if ($appId = "adguard" && $switchingApps = true && $hasConfig = false && \
+                $oldAnswered = true) do={
                 :if ($forceSwitch = false) do={
                     :put "      |-- [STOPPED] AdGuard Home has no config yet and would not answer DNS"
                     :put ("      |   |   until its setup wizard is done. '" . $oldName . "' keeps running.")
@@ -1094,7 +1072,7 @@
             }
             :put ("      |   |-- [OK] Started; checking stability (" . $cStabilitySeconds . "s)...")
             :delay [:totime ($cStabilitySeconds . "s")]
-            :if ([$getContainerState containerName=$newName] != "running") do={
+            :if ([$DnsFilterState containerName=$newName] != "running") do={
                 :set failReason "New container stopped after starting"
                 :error $failReason
             }
@@ -1140,7 +1118,7 @@
             :local restored [$startContainer containerName=$oldName timeout=$cStartTimeout]
             :if ($restored = true) do={
                 :delay [:totime ($cStabilitySeconds . "s")]
-                :set restored ([$getContainerState containerName=$oldName] = "running")
+                :set restored ([$DnsFilterState containerName=$oldName] = "running")
             }
             :if ($restored = true && $oldAnswered = true) do={
                 :set restored [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=$cDnsReadyTimeout]
@@ -1160,6 +1138,7 @@
 
         ## Success: make the new container permanent.
         :set servingName $newName
+        :if ([:len $newSize] > 0) do={ :set deployedImage ($appId . " image " . $newSize) }
         :do { /container set [find where name=$newName] start-on-boot=yes } on-error={ }
         :if ([:len $oldName] > 0) do={
             :if ($switchingApps = true) do={
@@ -1229,7 +1208,7 @@
 :if ($dnsFallbackActive = true) do={
     :put "[DNS] Restoring router DNS..."
     :local answers false
-    :if ([:len $servingName] > 0 && [$getContainerState containerName=$servingName] = "running") do={
+    :if ([:len $servingName] > 0 && [$DnsFilterState containerName=$servingName] = "running") do={
         :set answers [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=$cDnsReadyTimeout]
     }
     :local restoredOk false
@@ -1266,7 +1245,7 @@
 
 :if ($deploymentSuccess = false && $resultText != "ROLLED BACK") do={ :set resultText "FAILED" }
 :local finalState "none"
-:if ([:len $servingName] > 0) do={ :set finalState [$getContainerState containerName=$servingName] }
+:if ([:len $servingName] > 0) do={ :set finalState [$DnsFilterState containerName=$servingName] }
 :local healthcheckSummary "needs RouterOS 7.23+"
 :if ($healthcheckSupported = true) do={
     :set healthcheckSummary "unchanged"
@@ -1315,6 +1294,9 @@
                     /system script set ($updaterIds->0) source=$updaterSource
                 }
             }
+            :if ([:len $deployedImage] > 0) do={
+                /system script set [find where name=$cUpdaterName] comment=$deployedImage
+            }
             :put ("  Next time:   /system script run " . $cUpdaterName)
         } on-error={ }
     }
@@ -1329,6 +1311,7 @@
 :put "========================================"
 :put ""
 
+:do { /system script environment remove [find where name="DnsFilterState"] } on-error={ }
 :if ($deploymentSuccess = false) do={
     :error ($resultText . ": " . $failReason)
 }
