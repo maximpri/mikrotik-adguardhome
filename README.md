@@ -16,49 +16,116 @@ It sets up two RouterOS scripts, `mikrotik-adguardhome` and `mikrotik-adguardhom
 /system script run mikrotik-adguardhome
 ```
 
-For **Pi-hole**, run `:global AghApp "pihole"` first, or set `app` in the settings script.
+For **Pi-hole**, put `:global AghApp "pihole"; ` in front of the line, or set `app` in the settings script later:
 
-**The loader.** `mikrotik-adguardhome.rsc` runs on every update, so it handles whatever earlier versions left on the router:
+```routeros
+:global AghApp "pihole"; :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
+```
+
+When pasting, check that the line starts with `:` and ends with `$s`. Some terminals insert stray characters such as `v` or `c` from the paste shortcut; RouterOS then reports `syntax error`, or does nothing.
+
+See [Installing the bootstrap script](#installing-the-bootstrap-script) for other ways to install it, and for how to check, reset, or remove it.
+
+**The loader.** `mikrotik-adguardhome.rsc` is the bootstrap script. It runs on every update, so it handles whatever earlier versions left on the router:
 
 1. It rewrites `/system script mikrotik-adguardhome` as a two-line stub that downloads and runs the latest loader. An old, broken, or hand-made copy is replaced. The stub's comment, which records the deployed image, is kept.
 2. It reads your settings from `/system script mikrotik-adguardhome-settings`. On first use it creates that script, carrying over values from an earlier loader that kept settings in its own source.
-3. It downloads the version tagged `latest`. When GitHub reports which commit the tag points to, it pins the download to that commit, so no stale cached copy is used.
+3. It downloads the version tagged `latest`. When GitHub reports which commit the tag points to, it pins the download to that commit. Otherwise it prints `Using 'latest'` and downloads through GitHub's cache, which can serve the previous version for up to about 5 minutes after a new one is published.
 4. It downloads `adguardhome_script.rsc` to a temporary file, which has no size limit, imports it with your settings, and deletes the file. The deployment script is a single block, so a truncated download fails to parse and nothing runs.
 
 If anything fails or is rolled back, the run ends with an error and shows the reason in its summary.
 
-**Backup:** before changing anything, every run saves the router configuration with `/export file=mikrotik-adguardhome-backup`. If the backup can't be written, the run stops without changing anything. To restore settings from the backup, review `mikrotik-adguardhome-backup.rsc` and import what you need.
+**Backup:** before changing anything, every run saves the router configuration with `/export file=mikrotik-adguardhome-backup`. Each run overwrites the previous backup. If the backup can't be written, the run stops without changing anything. To restore settings from the backup, review `mikrotik-adguardhome-backup.rsc` and import what you need.
 
-Prefer to review the script first? Download it, edit the settings at the top, and import it:
+Prefer to review the script first, or change less common settings such as timeouts? Download the deployment script, edit the settings at the top, and import it. The loader always downloads the published script, so these edits apply only to runs you import by hand:
 
 ```routeros
 /tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/adguardhome_script.rsc"
 /import adguardhome_script.rsc
 ```
 
+## Installing the bootstrap script
+
+The bootstrap (loader) script is the only part that lives on the router permanently. Installing it creates two RouterOS scripts:
+
+| Script | Contents | Updated by runs |
+|---|---|---|
+| `mikrotik-adguardhome` | A two-line stub that downloads and runs the latest loader. Its comment records the deployed image. | Rewritten on every run |
+| `mikrotik-adguardhome-settings` | Your settings (see [Configuration](#configuration)) | Never |
+
+Installing it also runs a deployment right away, so the first run installs or upgrades the app. Use any one of these methods.
+
+**Terminal (recommended).** Paste the line from [Quick start](#quick-start).
+
+**Winbox or WebFig, without pasting into the terminal.** Open **System → Scripts**, add a script named `mikrotik-adguardhome`, and put this in **Source**:
+
+```routeros
+:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
+```
+
+Then click **Run Script**. This line is already the stub. The first run gives the script full permissions and creates the settings script.
+
+**File import.** Download the loader and import it:
+
+```routeros
+/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc"
+/import mikrotik-adguardhome.rsc
+/file remove mikrotik-adguardhome.rsc
+```
+
+**Check the installation:**
+
+```routeros
+/system script print detail where name~"^mikrotik-adguardhome"
+```
+
+**Reinstall.** Run any install method again. It rewrites the stub and keeps your settings. To start over with default settings, remove the settings script first:
+
+```routeros
+/system script remove [find name=mikrotik-adguardhome-settings]
+```
+
+**Uninstall the scripts.** This leaves the containers, their data, and router DNS untouched:
+
+```routeros
+/system scheduler remove [find name=mikrotik-adguardhome-update]
+/system script remove [find where name~"^mikrotik-adguardhome"]
+```
+
+Check `/ip dns print` first. If a run left the router on the fallback DNS, `mikrotik-adguardhome-restore` holds your original settings: run it before removing it. To also remove the app, stop and remove its container with `/container stop` and `/container remove`. The mounts, envs, veth, and the data under the storage path stay until you remove them.
+
 ## What a run does
 
 | Situation | Result |
 |---|---|
 | Nothing installed | Installs the chosen app: `INSTALLED` |
-| Installed; the image and settings have not changed | Downloads and compares the image, then removes the copy. Nothing restarts: `UP TO DATE` |
+| Installed; the image and settings have not changed | Checks Docker Hub only. Nothing is downloaded or restarted: `UP TO DATE` |
 | Installed; a new image is available or a setting such as `piholePassword` changed | Switches to the new container after checks: `UPGRADED` |
 | The new version fails a check | Starts the previous version again: `ROLLED BACK` |
 | The other app is chosen | Switches apps after checks; the old app's container is kept stopped: `SWITCHED TO ...` |
+| A check stops the run before any change (storage, DNS, consent) | Explains what to do; nothing is changed: `FAILED` |
 
 Every run ends with a summary of the result, container, address, router DNS state, healthcheck, and web UI address.
 
-**Self-healing.** Each run starts by repairing what an interrupted or failed run left behind. It removes a leftover `<name>-next` container or unused root directory, restores router DNS settings saved in `mikrotik-adguardhome-restore`, and removes a work-data mount that was added but never used. The script judges container state from RouterOS state flags, and from memory use on releases such as 7.24 that report no running field.
+**Self-healing.** Each run repairs what an interrupted or failed run, or an earlier version, left behind:
+
+- a leftover `<name>-next` container, or an unused root directory;
+- router DNS settings saved in `mikrotik-adguardhome-restore` while a fallback was active;
+- a work-data mount that was added but never used;
+- a run lock older than 20 minutes;
+- scripts and global variables from earlier versions (such as `dns-filter` and `dns-filter-restore`).
+
+The script judges container state from RouterOS state flags, and from memory use on releases such as 7.24 that report no running field.
 
 ## How upgrades stay safe
 
 1. **The current container keeps serving.** The new image is pulled into a second container, `<name>-next`, with its own root directory. A slow or failed download doesn't affect DNS.
-2. **No download without a change.** Before pulling, the script asks Docker Hub which digest the image tag points to. If it matches the digest recorded at the last successful run (in the comment of the `mikrotik-adguardhome` loader script), and no setting changed, nothing is downloaded or restarted. The first run after installing this version always switches once, because nothing is recorded yet. If the digest can't be read, the script pulls and switches as usual.
+2. **No download without a change.** Before pulling, the script asks Docker Hub's public tag API which digest the image tag points to. If it matches the digest recorded at the last successful run (in the comment of the `mikrotik-adguardhome` loader script), and no setting changed, nothing is downloaded or restarted. The first run after installing this version always switches once, because nothing is recorded yet. If the digest can't be read, the script pulls and switches as usual.
 3. **The switch is verified.** The script stops the old container and starts the new one. It then checks that the new one is running, still running after `cStabilitySeconds`, and answering DNS (if the old one was).
 4. **Rollback.** If any check fails, the script stops the new container, restores the config backup, and starts the old one again. Before an upgrade it backs up the main config file (`AdGuardHome.yaml` or `pihole.toml`, up to 60 KB), because the new version may migrate it to a format the old one can't read. The old container must then pass the same checks it passed before: running, stable, and answering DNS. If it can't, the run reports `CRITICAL` and keeps both containers for inspection.
 5. **Cleanup.** After a verified switch, the old container is removed and the new one takes the usual name (`adguardhome` or `pihole`). Leftovers from an interrupted run are cleaned up on the next run.
 
-An upgrade briefly needs room for two copies of the image on `cDefaultStorageMount`. A lock prevents two runs from overlapping, for example a scheduled run and a manual one.
+An upgrade briefly needs room for two copies of the image on the `storage` path. A lock prevents two runs from overlapping, for example a scheduled run and a manual one.
 
 ## Router DNS during upgrades
 
@@ -106,7 +173,7 @@ Edit the values in **System → Scripts → mikrotik-adguardhome-settings** (or 
 
 If the settings script has an error, the run stops before changing anything and says so. Delete the script to get a fresh one with defaults on the next run.
 
-`:global AghApp "pihole"` (or `"adguard"`) overrides `app` for one run. When neither is set, the script keeps the installed app and installs AdGuard Home if nothing is installed. Less common settings, such as timeouts and the healthcheck command, are at the top of `adguardhome_script.rsc`.
+`:global AghApp "pihole"` (or `"adguard"`) overrides `app` for one run. When neither is set, the script keeps the running app (or, if none is running, the one that starts on boot) and installs AdGuard Home if nothing is installed. Less common settings, such as timeouts and the healthcheck command, are at the top of `adguardhome_script.rsc`; see [Quick start](#quick-start) for how to run a modified copy.
 
 | App | Container | Root | Config mount | Other |
 |---|---|---|---|---|
@@ -117,12 +184,12 @@ Both apps use the same veth (`agh`) and address, so switching apps keeps the DNS
 
 `configStorage` can point at persistent storage, such as internal flash, when the rest is on a RAM disk.
 
-`latest` is mutable. Set an image tag for repeatable deployments.
+The image tag `latest` changes with every upstream release. Set a fixed image tag, such as `adguard/adguardhome:v0.107.79`, for repeatable deployments.
 
 ## Choosing or switching apps
 
-- **Install Pi-hole:** set `app` to `"pihole"` in the settings script, or run `:global AghApp "pihole"` before running the loader. The web UI is at `http://172.17.0.2/admin`. Set `piholePassword`, or find the generated password with `/container log pihole`.
-- **Install AdGuard Home:** run the loader and finish the setup wizard at `http://172.17.0.2:3000`.
+- **Install Pi-hole:** set `app` to `"pihole"` in the settings script, or run `:global AghApp "pihole"` before running the loader. The web UI is at `http://<address>/admin`. Set `piholePassword` first, or find the generated password with `/container log pihole`. Pi-hole starts with its own default blocklist; AdGuard Home settings and rules are not carried over.
+- **Install AdGuard Home:** run the loader and finish the setup wizard at `http://<address>:3000`.
 - **Switch apps:** choose the other app and run the loader. The new app is verified before it takes over. A failed check starts the old app again. The old app's container is kept stopped, with its data intact, until you remove it:
 
   ```routeros
@@ -156,7 +223,7 @@ If you already have a container bridge, attach `agh` to it instead. Then point c
 
 On RouterOS 7.23 and later, each new container gets a native healthcheck:
 
-- **AdGuard Home:** HTTP on port 3000, then port 80. Edit the command in the script if you use a custom web port.
+- **AdGuard Home:** HTTP on port 3000, then port 80. If AdGuard Home's web UI uses another port, the healthcheck reports unhealthy. That status is informational: the script doesn't enable `stop-on-unhealthy`, and its own checks use DNS.
 - **Pi-hole:** a `dig` query for `pi.hole`, matching Pi-hole's own Docker healthcheck.
 
 ```routeros
@@ -165,9 +232,9 @@ On RouterOS 7.23 and later, each new container gets a native healthcheck:
 
 On 7.22, the script relies on its own running, stability, and DNS checks.
 
-## Upgrading from script versions before 2.0
+## Upgrading from earlier versions
 
-Existing AdGuard Home deployments are upgraded in place. The first run pulls into `adguardhome-next` at `/usb1/agh-next`, switches, removes the old container, and renames the new one to `adguardhome`. Later upgrades alternate between `/usb1/agh` and `/usb1/agh-next`.
+Run the install line from [Quick start](#quick-start) once. It replaces the old updater scripts with the loader. Existing AdGuard Home deployments are upgraded in place. The first run pulls into `adguardhome-next` at `/usb1/agh-next`, switches, removes the old container, and renames the new one to `adguardhome`. Later upgrades alternate between `/usb1/agh` and `/usb1/agh-next`.
 
 Deployments from before 1.7.0 keep AdGuard Home's work data (statistics, query log, cached filter lists, login sessions) inside the container. The upgrade replaces the container, so the script stops and asks first. To move work data to `/usb1/work/agh`, and start statistics and the query log empty, run:
 
@@ -186,10 +253,12 @@ Then run the script again. Settings, users, rules, and filter lists in `AdGuardH
 /log print where message~"mikrotik-adguardhome"
 ```
 
-- **`syntax error` or a fetch error:** check router DNS and internet access with `:put [:resolve raw.githubusercontent.com]`. If certificate validation fails because of the CRL, add `check-certificate=yes-without-crl` to the fetch command.
+- **`syntax error`, or the line does nothing:** check that the pasted line starts with `:` and ends with `$s`, with no stray characters.
+- **A fetch error:** check router DNS and internet access with `:put [:resolve raw.githubusercontent.com]`. If certificate validation fails because of the CRL, add `check-certificate=yes-without-crl` to the fetch command.
+- **`[INFO] Using 'latest'`:** normal on RouterOS, which GitHub's API doesn't answer. A version published in the last few minutes may not be served yet.
 - **`Router DNS: fallback active` in the summary:** the container is not answering yet. Run the script again once it answers, or run `/system script run mikrotik-adguardhome-restore`.
 - **`Another run is in progress`:** another run started within the last 20 minutes. If it was interrupted, wait or clear the lock with `:set AghLock ""`.
-- **Slow image pulls:** increase `cPullTimeout`.
+- **Slow image pulls:** a pull that exceeds 10 minutes fails without touching the running container. Use faster storage, or run a modified copy with a larger `cPullTimeout` (see [Quick start](#quick-start)).
 - **No container network:** verify the veth address, bridge membership, gateway, and masquerade rule.
 
 ## Development
@@ -209,7 +278,7 @@ git push -f origin latest
 
 - Container support expands the router's attack surface. Keep RouterOS and the apps patched.
 - Do not expose the web UIs or DNS service to untrusted networks.
-- Images are pulled with certificate checks enabled. `latest` can change at any time; pin a tag if you need control over upgrades.
+- Images are pulled with certificate checks enabled. The image tag `latest` changes with upstream releases; pin an image tag if you need control over app upgrades. Script updates reach routers only when a maintainer moves the git tag `latest`.
 - The script changes router DNS servers only temporarily, only when they point at the container, and restores them once the container answers. It does not delete static DNS records.
 
 See MikroTik's [Container documentation](https://manual.mikrotik.com/docs/containers/) and [device-mode documentation](https://manual.mikrotik.com/docs/system-information-and-utilities/device-mode/).
