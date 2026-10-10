@@ -16,15 +16,14 @@
 #     server is used during the switch and the original settings are restored
 #     once the container answers again.
 #
-# Run it from the RouterOS terminal (see README.md):
-#   :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc" output=user as-value]->"data")]; $s
-# After the first successful run:  /system script run dns-filter
-# Choose Pi-hole first with:       :global DnsFilterApp "pihole"
+# Normally run by the mikrotik-adguardhome loader (mikrotik-adguardhome.rsc),
+# which downloads this file from GitHub, verifies it, and passes its settings
+# in the global AghOptions. See README.md. It also runs on its own via /import.
 #
-# Before changing anything, each run saves /export file=dns-filter-backup.
+# Before changing anything, each run saves /export file=mikrotik-adguardhome-backup.
 #
 # The whole script is one { } block, so a truncated download fails to parse
-# and nothing runs. The in-memory download limit is 63 KiB; stay under 60 KB.
+# and nothing runs.
 #
 # Prerequisites:
 #   - RouterOS 7.22 or later with the container package (ARM, ARM64, x86, CHR)
@@ -57,17 +56,36 @@
 :local cRegistryHost "registry-1.docker.io"
 
 ## Configuration export saved before any change ("" disables)
-:local cBackupFile "dns-filter-backup"
-## Short updater saved after a successful run ("" disables):
-##   /system script run dns-filter
-:local cUpdaterName "dns-filter"
-:local cScriptUrl "https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/agent/safe-upgrade-pihole/adguardhome_script.rsc"
+:local cBackupFile "mikrotik-adguardhome-backup"
+## Loader script whose comment records the deployed image digest
+:local cUpdaterName "mikrotik-adguardhome"
 :local cTmpDir ($cDefaultStorageMount . "/tmp")
 
 ## Fallback resolvers used while the router's DNS server is switching
 ## (comma-separated; "" disables) and the name used to test DNS.
 :local cFallbackDns "1.1.1.1"
 :local cDnsTestHost "cloudflare.com"
+
+## Settings passed by the loader override the values above.
+:global AghOptions
+:local opts $AghOptions
+:do { /system script environment remove [find where name="AghOptions"] } on-error={ }
+:if ([:typeof $opts] = "array") do={
+    :if ([:typeof ($opts->"app")] = "str") do={ :set cApp ($opts->"app") }
+    :if ([:len ($opts->"storage")] > 0) do={
+        :set cDefaultStorageMount ($opts->"storage")
+        :set cConfigStorageMount ($opts->"storage")
+        :set cTmpDir (($opts->"storage") . "/tmp")
+    }
+    :if ([:len ($opts->"configStorage")] > 0) do={ :set cConfigStorageMount ($opts->"configStorage") }
+    :if ([:len ($opts->"address")] > 0) do={ :set cContainerAddress ($opts->"address") }
+    :if ([:len ($opts->"gateway")] > 0) do={ :set cContainerGateway ($opts->"gateway") }
+    :if ([:typeof ($opts->"fallbackDns")] = "str") do={ :set cFallbackDns ($opts->"fallbackDns") }
+    :if ([:typeof ($opts->"piholePassword")] = "str") do={ :set cPiholePassword ($opts->"piholePassword") }
+    :if ([:len ($opts->"adguardImage")] > 0) do={ :set cAdguardImage ($opts->"adguardImage") }
+    :if ([:len ($opts->"piholeImage")] > 0) do={ :set cPiholeImage ($opts->"piholeImage") }
+    :if ([:len ($opts->"updater")] > 0) do={ :set cUpdaterName ($opts->"updater") }
+}
 
 ## RouterOS 7.23+ native healthcheck timing
 :local cHealthcheckInterval "00:00:30"
@@ -125,7 +143,7 @@
 ## DNS fallback state. While the fallback is active, the original settings
 ## are kept in this /system script, which survives reboots, lets a later run
 ## recover an interrupted one, and restores DNS when run by hand.
-:local cRestoreScript "dns-filter-restore"
+:local cRestoreScript "mikrotik-adguardhome-restore"
 :local dnsFallbackActive false
 :local dnsOriginalServers ""
 :local dnsOriginalDoh ""
@@ -141,7 +159,7 @@
 ## releases report state differently (7.24 has no running field), so state
 ## flags are queried first and memory use is the last resort. It is global
 ## so the other helpers can call it.
-:global DnsFilterState do={
+:global AghState do={
     :if ([:len [/container find where name=$containerName]] = 0) do={ :return "missing" }
     :local state ""
     :foreach f in={"extracting";"stopped";"running"} do={
@@ -202,7 +220,7 @@
 
 ## Waits until a new container finishes extracting. Returns the final state.
 :local waitForExtraction do={
-    :global DnsFilterState
+    :global AghState
     :local state "other"
     :local lastState ""
     :local elapsed 0
@@ -210,7 +228,7 @@
         $state != "missing" && $elapsed < [:tonum $timeout]) do={
         :delay [:totime ($poll . "s")]
         :set elapsed ($elapsed + [:tonum $poll])
-        :set state [$DnsFilterState containerName=$containerName]
+        :set state [$AghState containerName=$containerName]
         :if ($state != $lastState || ($elapsed % [:tonum $progress]) = 0) do={
             :put ("      |   |-- " . $elapsed . "s: " . $state)
             :set lastState $state
@@ -222,14 +240,14 @@
 ## Starts a container and waits until it is running. A container that was
 ## still stopping rejects the request, so it is re-sent while stopped.
 :local startContainer do={
-    :global DnsFilterState
+    :global AghState
     :do { /container start [find where name=$containerName] } on-error={ }
     :local state ""
     :local waited 0
     :while ($state != "running" && $waited < [:tonum $timeout]) do={
         :delay 2s
         :set waited ($waited + 2)
-        :set state [$DnsFilterState containerName=$containerName]
+        :set state [$AghState containerName=$containerName]
         :if ($state = "stopped") do={
             :do { /container start [find where name=$containerName] } on-error={ }
         }
@@ -239,9 +257,9 @@
 
 ## Ranks how active a container is: 2 running, 1 starts on boot, 0 neither.
 :local appScore do={
-    :global DnsFilterState
+    :global AghState
     :if ([:len $containerName] = 0) do={ :return 0 }
-    :if ([$DnsFilterState containerName=$containerName] = "running") do={ :return 2 }
+    :if ([$AghState containerName=$containerName] = "running") do={ :return 2 }
     :local boot false
     :do { :set boot [/container get [find where name=$containerName] start-on-boot] } on-error={ }
     :if ($boot = true || $boot = "yes") do={ :return 1 }
@@ -250,14 +268,14 @@
 
 ## Stops a container and waits until it is stopped (or gone).
 :local stopContainer do={
-    :global DnsFilterState
+    :global AghState
     :do { /container stop [find where name=$containerName] } on-error={ }
     :local state ""
     :local waited 0
     :while ($state != "stopped" && $state != "missing" && $waited < [:tonum $timeout]) do={
         :delay 2s
         :set waited ($waited + 2)
-        :set state [$DnsFilterState containerName=$containerName]
+        :set state [$AghState containerName=$containerName]
     }
     :return ($state = "stopped" || $state = "missing")
 }
@@ -348,7 +366,7 @@
 ## Returns the live container of an app (base or base-next), or "". With
 ## both present, the running one wins, then the one that starts on boot.
 :local findLive do={
-    :global DnsFilterState
+    :global AghState
     :local candidates [:toarray ""]
     :set candidates ($candidates, $base)
     :set candidates ($candidates, ($base . "-next"))
@@ -359,7 +377,7 @@
     :if ([:len $names] = 0) do={ :return "" }
     :local chosen ""
     :foreach n in=$names do={
-        :if ([:len $chosen] = 0 && [$DnsFilterState containerName=$n] = "running") do={ :set chosen $n }
+        :if ([:len $chosen] = 0 && [$AghState containerName=$n] = "running") do={ :set chosen $n }
     }
     :foreach n in=$names do={
         :local boot false
@@ -380,7 +398,7 @@
         :put "      |   |-- [OK] Native healthcheck configured"
     } on-error={
         :put "      |   |-- [WARNING] RouterOS rejected the healthcheck settings"
-        :log warning "DNS filter: native healthcheck configuration failed"
+        :log warning "mikrotik-adguardhome: native healthcheck configuration failed"
     }
     :return $configured
 }
@@ -395,25 +413,25 @@
 :put "========================================"
 
 ## Prevent overlapping runs (for example a scheduler and a manual run).
-:global DnsFilterLock
+:global AghLock
 :local uptimeNow [/system resource get uptime]
-:if ([:typeof $DnsFilterLock] = "time") do={
-    :if (($uptimeNow - $DnsFilterLock) < 01:00:00) do={
+:if ([:typeof $AghLock] = "time") do={
+    :if (($uptimeNow - $AghLock) < 01:00:00) do={
         :put "  [FAILED] Another run started less than an hour ago and is still active."
-        :put "  If that run was interrupted, clear the lock with: :set DnsFilterLock \"\""
+        :put "  If that run was interrupted, clear the lock with: :set AghLock \"\""
         :error "Another run is in progress"
     }
 }
-:set DnsFilterLock $uptimeNow
+:set AghLock $uptimeNow
 
-## :global DnsFilterApp overrides cApp for this run only.
-:global DnsFilterApp
-:if ([:typeof $DnsFilterApp] = "str" && [:len $DnsFilterApp] > 0) do={
-    :set cApp $DnsFilterApp
+## :global AghApp overrides cApp for this run only.
+:global AghApp
+:if ([:typeof $AghApp] = "str" && [:len $AghApp] > 0) do={
+    :set cApp $AghApp
 }
-:global DnsFilterForce
-:local forceSwitch ($DnsFilterForce = "yes")
-:do { /system script environment remove [find where name="DnsFilterApp" or name="DnsFilterForce"] } on-error={ }
+:global AghForce
+:local forceSwitch ($AghForce = "yes")
+:do { /system script environment remove [find where name="AghApp" or name="AghForce"] } on-error={ }
 
 :set stepNum ($stepNum + 1)
 :put ""
@@ -442,8 +460,8 @@
 :put ("      |-- Detected: " . $rosVersion)
 :if (!($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= 22))) do={
     :put "      |-- [FAILED] RouterOS 7.22 or later is required"
-    :set DnsFilterLock ""
-    :log error ("DNS filter: RouterOS " . $rosVersion . " is not supported")
+    :set AghLock ""
+    :log error ("mikrotik-adguardhome: RouterOS " . $rosVersion . " is not supported")
     :error "Version check failed"
 }
 :if ($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= 23)) do={
@@ -482,6 +500,20 @@
     } else={
         :put "      |-- [SKIPPED] cBackupFile is empty"
     }
+
+    ## Migrate scripts left by earlier versions of this project.
+    :do {
+        :if ([:len [/system script find where name="dns-filter-restore"]] > 0 && \
+            [:len [/system script find where name=$cRestoreScript]] = 0) do={
+            /system script set [find where name="dns-filter-restore"] name=$cRestoreScript
+        }
+        :foreach id in=[/system script find where name="dns-filter"] do={
+            :if ([:typeof [:find [/system script get $id source] "maximpri/mikrotik-adguardhome"]] = "num") do={
+                /system script remove $id
+                :put "      |-- [CLEANUP] Removed the old 'dns-filter' updater script"
+            }
+        }
+    } on-error={ }
 
     ## ---------- Step 3: Container support and app ----------
     :set stepNum ($stepNum + 1)
@@ -721,7 +753,7 @@
             :if ($dnsDohUsesContainer = true) do={ /ip dns set use-doh-server="" }
             /ip dns cache flush
             :put ("      |-- [OK] Temporary router DNS: " . $tempServers)
-            :log warning ("DNS filter: router DNS temporarily " . $tempServers . \
+            :log warning ("mikrotik-adguardhome: router DNS temporarily " . $tempServers . \
                 " (original: " . $dnsOriginalServers . ")")
         }
     } else={
@@ -795,8 +827,8 @@
                 :put ("      |-- [STOPPED] '" . $liveName . "' keeps its statistics and query log inside")
                 :put "      |   |   the container. Moving them to storage starts them empty. Settings,"
                 :put "      |   |   users, rules and filter lists are kept. Nothing was changed."
-                :put "      |-- To proceed: :global DnsFilterForce \"yes\" and run again"
-                :set failReason "Work-data move needs consent (DnsFilterForce)"
+                :put "      |-- To proceed: :global AghForce \"yes\" and run again"
+                :set failReason "Work-data move needs consent (AghForce)"
                 :error $failReason
             }
             /container mounts add list=$appMountList src=$appWorkSrc dst=$appWorkDst
@@ -964,7 +996,7 @@
             :set upToDate ([/system script get ($updaterIds->0) comment] = ($appId . " " . $remote))
         }
         ## A live container that is not running is replaced even if current.
-        :if ($upToDate = true && [$DnsFilterState containerName=$liveName] != "running") do={
+        :if ($upToDate = true && [$AghState containerName=$liveName] != "running") do={
             :set upToDate false
         }
     } else={
@@ -1034,7 +1066,7 @@
             [:len [/file find where name=("/" . $confFile)]] > 0 || \
             [:len [/file find where name~("/" . $appConfigFile . "\$")]] > 0)
         :if ([:len $oldName] > 0) do={
-            :if ([$DnsFilterState containerName=$oldName] = "running") do={
+            :if ([$AghState containerName=$oldName] = "running") do={
                 :set oldAnswered [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=15]
             }
             :set requireDns $oldAnswered
@@ -1047,9 +1079,9 @@
                 :if ($forceSwitch = false) do={
                     :put "      |-- [STOPPED] AdGuard Home has no config yet and would not answer DNS"
                     :put ("      |   |   until its setup wizard is done. '" . $oldName . "' keeps running.")
-                    :put "      |-- To switch anyway: :global DnsFilterForce \"yes\" and run again"
+                    :put "      |-- To switch anyway: :global AghForce \"yes\" and run again"
                     :do { /container remove [find where name=$newName] } on-error={ }
-                    :set failReason "Switch needs AdGuard Home setup (or DnsFilterForce)"
+                    :set failReason "Switch needs AdGuard Home setup (or AghForce)"
                     :error $failReason
                 }
                 :set requireDns false
@@ -1090,7 +1122,7 @@
             }
             :put ("      |   |-- [OK] Started; checking stability (" . $cStabilitySeconds . "s)...")
             :delay [:totime ($cStabilitySeconds . "s")]
-            :if ([$DnsFilterState containerName=$newName] != "running") do={
+            :if ([$AghState containerName=$newName] != "running") do={
                 :set failReason "New container stopped after starting"
                 :error $failReason
             }
@@ -1136,7 +1168,7 @@
             :local restored [$startContainer containerName=$oldName timeout=$cStartTimeout]
             :if ($restored = true) do={
                 :delay [:totime ($cStabilitySeconds . "s")]
-                :set restored ([$DnsFilterState containerName=$oldName] = "running")
+                :set restored ([$AghState containerName=$oldName] = "running")
             }
             :if ($restored = true && $oldAnswered = true) do={
                 :set restored [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=$cDnsReadyTimeout]
@@ -1226,7 +1258,7 @@
 :if ($dnsFallbackActive = true) do={
     :put "[DNS] Restoring router DNS..."
     :local answers false
-    :if ([:len $servingName] > 0 && [$DnsFilterState containerName=$servingName] = "running") do={
+    :if ([:len $servingName] > 0 && [$AghState containerName=$servingName] = "running") do={
         :set answers [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=$cDnsReadyTimeout]
     }
     :local restoredOk false
@@ -1244,18 +1276,18 @@
     :if ($restoredOk = true) do={
         :set dnsStatus ("restored (" . $dnsOriginalServers . ")")
         :put ("      |-- [OK] Restored " . $dnsOriginalServers . " and flushed the cache")
-        :log info "DNS filter: router DNS restored"
+        :log info "mikrotik-adguardhome: router DNS restored"
     } else={
         :put ("      |-- [WARNING] Keeping the fallback; " . $containerIp . " is not answering DNS")
         :put ("      |-- Original servers: " . $dnsOriginalServers)
         :put "      |-- Run this script again once it answers, or restore manually with:"
         :put ("      |   |-- /system script run " . $cRestoreScript)
         :set warningCount ($warningCount + 1)
-        :log warning ("DNS filter: fallback DNS kept; original servers: " . $dnsOriginalServers)
+        :log warning ("mikrotik-adguardhome: fallback DNS kept; original servers: " . $dnsOriginalServers)
     }
 }
 
-:set DnsFilterLock ""
+:set AghLock ""
 
 ## ========================================
 ## Summary
@@ -1263,7 +1295,7 @@
 
 :if ($deploymentSuccess = false && $resultText != "ROLLED BACK") do={ :set resultText "FAILED" }
 :local finalState "none"
-:if ([:len $servingName] > 0) do={ :set finalState [$DnsFilterState containerName=$servingName] }
+:if ([:len $servingName] > 0) do={ :set finalState [$AghState containerName=$servingName] }
 :local healthcheckSummary "needs RouterOS 7.23+"
 :if ($healthcheckSupported = true) do={
     :set healthcheckSummary "unchanged"
@@ -1299,37 +1331,26 @@
             :put ("  Web UI:      http://" . $containerIp)
         }
     }
-    ## Save a short updater so later runs are: /system script run dns-filter
-    :if ([:len $cUpdaterName] > 0 && [:len $cScriptUrl] > 0) do={
-        :local updaterSource (":local s [:parse ([/tool fetch url=\"" . $cScriptUrl . \
-            "\" output=user as-value]->\"data\")]; \$s")
-        :do {
-            :local updaterIds [/system script find where name=$cUpdaterName]
-            :if ([:len $updaterIds] = 0) do={
-                /system script add name=$cUpdaterName source=$updaterSource
-            } else={
-                :if ([/system script get ($updaterIds->0) source] != $updaterSource) do={
-                    /system script set ($updaterIds->0) source=$updaterSource
-                }
-            }
-            :if ([:len $deployedImage] > 0) do={
-                /system script set [find where name=$cUpdaterName] comment=$deployedImage
-            }
-            :put ("  Next time:   /system script run " . $cUpdaterName)
-        } on-error={ }
+    ## Record the deployed image on the loader for the next up-to-date check.
+    :local updaterIds [/system script find where name=$cUpdaterName]
+    :if ([:len $updaterIds] > 0) do={
+        :if ([:len $deployedImage] > 0) do={
+            :do { /system script set ($updaterIds->0) comment=$deployedImage } on-error={ }
+        }
+        :put ("  Next time:   /system script run " . $cUpdaterName)
     }
-    :log info ("DNS filter: " . $resultText . " " . $appTitle)
+    :log info ("mikrotik-adguardhome: " . $resultText . " " . $appTitle)
 } else={
     :put "  Check:       /container print detail; /ip dns print"
     :if ([:len $cBackupFile] > 0) do={
         :put ("  Backup:      " . $cBackupFile . ".rsc")
     }
-    :log error ("DNS filter: " . $resultText . ": " . $failReason)
+    :log error ("mikrotik-adguardhome: " . $resultText . ": " . $failReason)
 }
 :put "========================================"
 :put ""
 
-:do { /system script environment remove [find where name="DnsFilterState"] } on-error={ }
+:do { /system script environment remove [find where name="AghState"] } on-error={ }
 :if ($deploymentSuccess = false) do={
     :error ($resultText . ": " . $failReason)
 }

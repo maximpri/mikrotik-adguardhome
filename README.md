@@ -7,24 +7,27 @@ A RouterOS script that installs, upgrades, or switches between [AdGuard Home](ht
 Paste this into the RouterOS terminal:
 
 ```routeros
-:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc" output=user as-value]->"data")]; $s
+:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
 ```
 
-It installs AdGuard Home, or upgrades whichever app is already installed. For **Pi-hole**, run this first:
+It installs the `mikrotik-adguardhome` loader as a RouterOS script, then installs AdGuard Home, or upgrades whichever app is already installed. From then on, the whole command is:
 
 ```routeros
-:global DnsFilterApp "pihole"
+/system script run mikrotik-adguardhome
 ```
 
-After the first successful run, the script saves a short updater. Use it from then on:
+For **Pi-hole**, run `:global AghApp "pihole"` first, or set `app` in the loader's settings.
 
-```routeros
-/system script run dns-filter
-```
+**The loader.** `mikrotik-adguardhome.rsc` is a small script that keeps your settings on the router and fetches everything else from GitHub on each run:
 
-The line downloads the script into memory, without writing a file to flash. The whole script is a single block, so a truncated download fails to parse and nothing runs. If anything fails or is rolled back, the run ends with an error and shows the reason in its summary.
+1. It resolves the branch to one commit, so every piece comes from the same version and no stale cached copy is used.
+2. It downloads `adguardhome_script.rsc` in 60 KB ranges, so the deployment script isn't limited by the 63 KiB that a single `/tool fetch` can hold in memory.
+3. It checks the end-of-file marker. The deployment script is a single block, so a truncated download fails to parse and nothing runs.
+4. It runs the deployment script with your settings.
 
-**Backup:** before changing anything, every run saves the router configuration with `/export file=dns-filter-backup`. If the backup can't be written, the run stops without changing anything. To restore settings from the backup, review `dns-filter-backup.rsc` and import what you need. Set `cBackupFile` to `""` to skip the backup.
+If anything fails or is rolled back, the run ends with an error and shows the reason in its summary.
+
+**Backup:** before changing anything, every run saves the router configuration with `/export file=mikrotik-adguardhome-backup`. If the backup can't be written, the run stops without changing anything. To restore settings from the backup, review `mikrotik-adguardhome-backup.rsc` and import what you need.
 
 Prefer to review the script first? Download it, edit the settings at the top, and import it:
 
@@ -39,18 +42,18 @@ Prefer to review the script first? Download it, edit the settings at the top, an
 |---|---|
 | Nothing installed | Installs the chosen app: `INSTALLED` |
 | Installed; the image and settings have not changed | Downloads and compares the image, then removes the copy. Nothing restarts: `UP TO DATE` |
-| Installed; a new image is available or a setting such as `cPiholePassword` changed | Switches to the new container after checks: `UPGRADED` |
+| Installed; a new image is available or a setting such as `piholePassword` changed | Switches to the new container after checks: `UPGRADED` |
 | The new version fails a check | Starts the previous version again: `ROLLED BACK` |
 | The other app is chosen | Switches apps after checks; the old app's container is kept stopped: `SWITCHED TO ...` |
 
 Every run ends with a summary of the result, container, address, router DNS state, healthcheck, and web UI address.
 
-**Self-healing.** Each run starts by repairing what an interrupted or failed run left behind. It removes a leftover `<name>-next` container or unused root directory, restores router DNS settings saved in `dns-filter-restore`, and removes a work-data mount that was added but never used. The script judges container state from RouterOS state flags, and from memory use on releases such as 7.24 that report no running field.
+**Self-healing.** Each run starts by repairing what an interrupted or failed run left behind. It removes a leftover `<name>-next` container or unused root directory, restores router DNS settings saved in `mikrotik-adguardhome-restore`, and removes a work-data mount that was added but never used. The script judges container state from RouterOS state flags, and from memory use on releases such as 7.24 that report no running field.
 
 ## How upgrades stay safe
 
 1. **The current container keeps serving.** The new image is pulled into a second container, `<name>-next`, with its own root directory. A slow or failed download doesn't affect DNS.
-2. **No download without a change.** Before pulling, the script asks Docker Hub which digest the image tag points to. If it matches the digest recorded at the last successful run (in the comment of the `dns-filter` updater script), and no setting changed, nothing is downloaded or restarted. The first run after installing this version always switches once, because nothing is recorded yet. If the digest can't be read, the script pulls and switches as usual.
+2. **No download without a change.** Before pulling, the script asks Docker Hub which digest the image tag points to. If it matches the digest recorded at the last successful run (in the comment of the `mikrotik-adguardhome` loader script), and no setting changed, nothing is downloaded or restarted. The first run after installing this version always switches once, because nothing is recorded yet. If the digest can't be read, the script pulls and switches as usual.
 3. **The switch is verified.** The script stops the old container and starts the new one. It then checks that the new one is running, still running after `cStabilitySeconds`, and answering DNS (if the old one was).
 4. **Rollback.** If any check fails, the script stops the new container, restores the config backup, and starts the old one again. Before an upgrade it backs up the main config file (`AdGuardHome.yaml` or `pihole.toml`, up to 60 KB), because the new version may migrate it to a format the old one can't read. The old container must then pass the same checks it passed before: running, stable, and answering DNS. If it can't, the run reports `CRITICAL` and keeps both containers for inspection.
 5. **Cleanup.** After a verified switch, the old container is removed and the new one takes the usual name (`adguardhome` or `pihole`). Leftovers from an interrupted run are cleaned up on the next run.
@@ -61,15 +64,15 @@ An upgrade briefly needs room for two copies of the image on `cDefaultStorageMou
 
 If the router resolves through the container, the router would lose DNS while the container switches. The script detects this: `/ip dns` `servers` contains the container address, or `use-doh-server` points at it. In that case it:
 
-1. Puts `cFallbackDns` (default `1.1.1.1`) first in the router's DNS servers and removes the container from the list. It also clears a DoH server that points at the container. Then it flushes the DNS cache.
+1. Puts the `fallbackDns` setting (default `1.1.1.1`) first in the router's DNS servers and removes the container from the list. It also clears a DoH server that points at the container. Then it flushes the DNS cache.
 2. Runs the deployment.
-3. Waits until the serving container resolves `cDnsTestHost`.
+3. Waits until the serving container resolves a test name (`cDnsTestHost`).
 4. Restores the original servers and DoH setting exactly, and flushes the cache again so no unfiltered answers stay cached.
 
-If nothing answers DNS, the fallback stays so the router keeps working. While the fallback is active, the original settings are saved in a `/system script` named `dns-filter-restore`. It survives reboots, the next run restores the settings from it, and you can run it by hand once the container answers again:
+If nothing answers DNS, the fallback stays so the router keeps working. While the fallback is active, the original settings are saved in a `/system script` named `mikrotik-adguardhome-restore`. It survives reboots, the next run restores the settings from it, and you can run it by hand once the container answers again:
 
 ```routeros
-/system script run dns-filter-restore
+/system script run mikrotik-adguardhome-restore
 ```
 
 If you change the router's DNS servers yourself in the meantime, the next run discards the saved settings instead of overwriting yours.
@@ -86,23 +89,21 @@ Clients that use the router as their DNS server are covered by the fallback. Cli
 
 ## Configuration
 
-Settings are at the top of the script:
+Edit the settings in **System → Scripts → mikrotik-adguardhome** (or `/system script edit mikrotik-adguardhome source`). Updates to the deployment script never overwrite them:
 
 ```routeros
-:local cApp ""                  # "adguard", "pihole", or "" to keep the installed app
-:local cAdguardImage "adguard/adguardhome:latest"
-:local cPiholeImage "pihole/pihole:latest"
-:local cPiholePassword ""       # "" keeps the current password
-:local cDefaultStorageMount "/usb1"
-:local cConfigStorageMount $cDefaultStorageMount
-:local cInterface "agh"
-:local cContainerAddress "172.17.0.2/24"
-:local cContainerGateway "172.17.0.1"
-:local cFallbackDns "1.1.1.1"
-:local cPullTimeout 600
+:local app ""                   # "adguard", "pihole", or "" to keep the installed app
+:local storage "/usb1"
+:local configStorage ""         # "" keeps the config on the same storage
+:local address "172.17.0.2/24"
+:local gateway "172.17.0.1"
+:local fallbackDns "1.1.1.1"    # "" disables the router DNS fallback
+:local piholePassword ""        # "" keeps the current password
+:local adguardImage "adguard/adguardhome:latest"
+:local piholeImage "pihole/pihole:latest"
 ```
 
-`:global DnsFilterApp "pihole"` (or `"adguard"`) overrides `cApp` for one run. When neither is set, the script keeps the installed app and installs AdGuard Home if nothing is installed.
+`:global AghApp "pihole"` (or `"adguard"`) overrides `app` for one run. When neither is set, the script keeps the installed app and installs AdGuard Home if nothing is installed. Less common settings, such as timeouts and the healthcheck command, are at the top of `adguardhome_script.rsc`.
 
 | App | Container | Root | Config mount | Other |
 |---|---|---|---|---|
@@ -111,31 +112,29 @@ Settings are at the top of the script:
 
 Both apps use the same veth (`agh`) and address, so switching apps keeps the DNS server address unchanged.
 
-`cConfigStorageMount` can point at persistent storage, such as internal flash, when the rest is on a RAM disk.
+`configStorage` can point at persistent storage, such as internal flash, when the rest is on a RAM disk.
 
 `latest` is mutable. Set an image tag for repeatable deployments.
 
 ## Choosing or switching apps
 
-- **Install Pi-hole:** run the Pi-hole one-liner. The web UI is at `http://172.17.0.2/admin`. Set `cPiholePassword`, or find the generated password with `/container log pihole`.
-- **Install AdGuard Home:** run the default one-liner and finish the setup wizard at `http://172.17.0.2:3000`.
-- **Switch apps:** run the one-liner for the other app. The new app is verified before it takes over. A failed check starts the old app again. The old app's container is kept stopped, with its data intact, until you remove it:
+- **Install Pi-hole:** set `app` to `"pihole"` in the loader settings, or run `:global AghApp "pihole"` before running the loader. The web UI is at `http://172.17.0.2/admin`. Set `piholePassword`, or find the generated password with `/container log pihole`.
+- **Install AdGuard Home:** run the loader and finish the setup wizard at `http://172.17.0.2:3000`.
+- **Switch apps:** choose the other app and run the loader. The new app is verified before it takes over. A failed check starts the old app again. The old app's container is kept stopped, with its data intact, until you remove it:
 
   ```routeros
   /container remove [find name=adguardhome]
   ```
 
-  A freshly installed AdGuard Home answers DNS only after its setup wizard. If the current app is answering DNS, the script won't replace it with an unconfigured AdGuard Home; the current app keeps running. To switch anyway, accepting a DNS outage until the wizard is done, run `:global DnsFilterForce "yes"` before the one-liner. Switching back to an app whose container was kept stopped reuses its configuration and is verified like any upgrade.
+  A freshly installed AdGuard Home answers DNS only after its setup wizard. If the current app is answering DNS, the script won't replace it with an unconfigured AdGuard Home; the current app keeps running. To switch anyway, accepting a DNS outage until the wizard is done, run `:global AghForce "yes"` before the loader. Switching back to an app whose container was kept stopped reuses its configuration and is verified like any upgrade.
 
 ## Scheduled updates (optional)
 
-After the first run, schedule the saved updater:
-
 ```routeros
-/system scheduler add name=dns-filter-update interval=1d start-time=04:00:00 on-event="/system script run dns-filter"
+/system scheduler add name=mikrotik-adguardhome-update interval=1d start-time=04:00:00 on-event="/system script run mikrotik-adguardhome"
 ```
 
-Scheduled runs keep the installed app. Results are written to the RouterOS log under `DNS filter:`.
+Scheduled runs keep the installed app. Results are written to the RouterOS log under `mikrotik-adguardhome:`.
 
 ## Complete the network setup
 
@@ -170,7 +169,7 @@ Existing AdGuard Home deployments are upgraded in place. The first run pulls int
 Deployments from before 1.7.0 keep AdGuard Home's work data (statistics, query log, cached filter lists, login sessions) inside the container. The upgrade replaces the container, so the script stops and asks first. To move work data to `/usb1/work/agh`, and start statistics and the query log empty, run:
 
 ```routeros
-:global DnsFilterForce "yes"
+:global AghForce "yes"
 ```
 
 Then run the script again. Settings, users, rules, and filter lists in `AdGuardHome.yaml` are kept. If that run fails or rolls back, the new mount is removed again, so the old container keeps its data.
@@ -181,18 +180,18 @@ Then run the script again. Settings, users, rules, and filter lists in `AdGuardH
 /container print detail
 /container log adguardhome
 /ip dns print
-/log print where message~"DNS filter"
+/log print where message~"mikrotik-adguardhome"
 ```
 
 - **`syntax error` or a fetch error:** check router DNS and internet access with `:put [:resolve raw.githubusercontent.com]`. If certificate validation fails because of the CRL, add `check-certificate=yes-without-crl` to the fetch command.
-- **`Router DNS: fallback active` in the summary:** the container is not answering yet. Run the script again once it answers, or run `/system script run dns-filter-restore`.
-- **`Another run is in progress`:** a previous run was interrupted. Clear the lock with `:set DnsFilterLock ""`.
+- **`Router DNS: fallback active` in the summary:** the container is not answering yet. Run the script again once it answers, or run `/system script run mikrotik-adguardhome-restore`.
+- **`Another run is in progress`:** a previous run was interrupted. Clear the lock with `:set AghLock ""`.
 - **Slow image pulls:** increase `cPullTimeout`.
 - **No container network:** verify the veth address, bridge membership, gateway, and masquerade rule.
 
 ## Development
 
-`tools/lint_rsc.py` runs in CI. It checks that the script stays under 60 KB (the in-memory download limit is 63 KiB), that it is a single `{ }` block ending with the end-of-file marker, that delimiters balance, and that every variable is declared.
+`tools/lint_rsc.py` runs in CI on both scripts. It checks that each is a single `{ }` block ending with the end-of-file marker, that delimiters balance, that every variable is declared, and that the loader stays small enough for a single in-memory fetch.
 
 ## Security notes
 

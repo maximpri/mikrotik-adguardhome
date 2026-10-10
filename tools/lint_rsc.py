@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Static checks for adguardhome_script.rsc (no RouterOS needed).
+"""Static checks for the RouterOS scripts (no RouterOS needed).
 
-- The one-line installer loads the script with /tool fetch output=user,
-  which silently truncates at 64512 bytes; keep a safety margin.
+Usage: lint_rsc.py FILE [MAX_BYTES]
+
+- A single /tool fetch output=user silently truncates at 64512 bytes. The
+  loader (mikrotik-adguardhome.rsc) is fetched that way, so keep it small;
+  it downloads adguardhome_script.rsc in ranges, so that file may be larger.
 - The whole script must be one { } block, so a truncated download fails
   to parse instead of running partially.
 - The completeness marker must appear exactly once, as the last line.
@@ -13,13 +16,13 @@ import re
 import sys
 
 PATH = sys.argv[1] if len(sys.argv) > 1 else "adguardhome_script.rsc"
-MAX_BYTES = 60000
+MAX_BYTES = int(sys.argv[2]) if len(sys.argv) > 2 else 60000
 MARKER = "#SCRIPT-COMPLETE"
 # Function arguments and loop variables used inside helper functions.
 ARGS = {
     "containerName", "timeout", "poll", "progress", "command", "value", "path",
     "mode", "src", "dst", "base", "image", "host", "server", "k", "v", "s", "f", "d", "i",
-    "n", "c", "m", "p", "sep", "mountId",
+    "n", "c", "m", "p", "id", "sep", "mountId",
 }
 
 text = open(PATH, encoding="utf-8").read()
