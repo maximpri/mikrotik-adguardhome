@@ -10,20 +10,22 @@ Paste this into the RouterOS terminal:
 :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
 ```
 
-It installs the `mikrotik-adguardhome` loader as a RouterOS script, then installs AdGuard Home, or upgrades whichever app is already installed. From then on, the whole command is:
+It sets up two RouterOS scripts, `mikrotik-adguardhome` and `mikrotik-adguardhome-settings`, then installs AdGuard Home, or upgrades whichever app is already installed. From then on, the whole command is:
 
 ```routeros
 /system script run mikrotik-adguardhome
 ```
 
-For **Pi-hole**, run `:global AghApp "pihole"` first, or set `app` in the loader's settings.
+For **Pi-hole**, run `:global AghApp "pihole"` first, or set `app` in the settings script.
 
-**The loader.** `mikrotik-adguardhome.rsc` is a small script that keeps your settings on the router and fetches everything else from GitHub on each run:
+**The loader.** `mikrotik-adguardhome.rsc` runs on every update, so it handles whatever earlier versions left on the router:
 
-1. It resolves the branch to one commit, so every piece comes from the same version and no stale cached copy is used.
-2. It downloads `adguardhome_script.rsc` in 60 KB ranges, so the deployment script isn't limited by the 63 KiB that a single `/tool fetch` can hold in memory.
-3. It checks the end-of-file marker. The deployment script is a single block, so a truncated download fails to parse and nothing runs.
-4. It runs the deployment script with your settings.
+1. It rewrites `/system script mikrotik-adguardhome` as a two-line stub that downloads and runs the latest loader. An old, broken, or hand-made copy is replaced. The stub's comment, which records the deployed image, is kept.
+2. It reads your settings from `/system script mikrotik-adguardhome-settings`. On first use it creates that script, carrying over values from an earlier loader that kept settings in its own source.
+3. It resolves the branch to one commit, so every piece comes from the same version and no stale cached copy is used.
+4. It downloads `adguardhome_script.rsc` in 60 KB ranges, so the deployment script isn't limited by the 63 KiB that a single `/tool fetch` can hold in memory.
+5. It checks the end-of-file marker. The deployment script is a single block, so a truncated download fails to parse and nothing runs.
+6. It runs the deployment script with your settings.
 
 If anything fails or is rolled back, the run ends with an error and shows the reason in its summary.
 
@@ -89,19 +91,22 @@ Clients that use the router as their DNS server are covered by the fallback. Cli
 
 ## Configuration
 
-Edit the settings in **System → Scripts → mikrotik-adguardhome** (or `/system script edit mikrotik-adguardhome source`). Updates to the deployment script never overwrite them:
+Edit the values in **System → Scripts → mikrotik-adguardhome-settings** (or `/system script edit mikrotik-adguardhome-settings source`). Updates never overwrite this script:
 
 ```routeros
-:local app ""                   # "adguard", "pihole", or "" to keep the installed app
-:local storage "/usb1"
-:local configStorage ""         # "" keeps the config on the same storage
-:local address "172.17.0.2/24"
-:local gateway "172.17.0.1"
-:local fallbackDns "1.1.1.1"    # "" disables the router DNS fallback
-:local piholePassword ""        # "" keeps the current password
-:local adguardImage "adguard/adguardhome:latest"
-:local piholeImage "pihole/pihole:latest"
+:global AghSettings [:toarray ""]
+:set ($AghSettings->"app") ""                  # adguard, pihole, or empty to keep the installed app
+:set ($AghSettings->"storage") "/usb1"
+:set ($AghSettings->"configStorage") ""        # empty keeps the config on the same storage
+:set ($AghSettings->"address") "172.17.0.2/24"
+:set ($AghSettings->"gateway") "172.17.0.1"
+:set ($AghSettings->"fallbackDns") "1.1.1.1"   # empty disables the router DNS fallback
+:set ($AghSettings->"piholePassword") ""       # empty keeps the current password
+:set ($AghSettings->"adguardImage") "adguard/adguardhome:latest"
+:set ($AghSettings->"piholeImage") "pihole/pihole:latest"
 ```
+
+If the settings script has an error, the run stops before changing anything and says so. Delete the script to get a fresh one with defaults on the next run.
 
 `:global AghApp "pihole"` (or `"adguard"`) overrides `app` for one run. When neither is set, the script keeps the installed app and installs AdGuard Home if nothing is installed. Less common settings, such as timeouts and the healthcheck command, are at the top of `adguardhome_script.rsc`.
 
@@ -118,7 +123,7 @@ Both apps use the same veth (`agh`) and address, so switching apps keeps the DNS
 
 ## Choosing or switching apps
 
-- **Install Pi-hole:** set `app` to `"pihole"` in the loader settings, or run `:global AghApp "pihole"` before running the loader. The web UI is at `http://172.17.0.2/admin`. Set `piholePassword`, or find the generated password with `/container log pihole`.
+- **Install Pi-hole:** set `app` to `"pihole"` in the settings script, or run `:global AghApp "pihole"` before running the loader. The web UI is at `http://172.17.0.2/admin`. Set `piholePassword`, or find the generated password with `/container log pihole`.
 - **Install AdGuard Home:** run the loader and finish the setup wizard at `http://172.17.0.2:3000`.
 - **Switch apps:** choose the other app and run the loader. The new app is verified before it takes over. A failed check starts the old app again. The old app's container is kept stopped, with its data intact, until you remove it:
 
@@ -185,7 +190,7 @@ Then run the script again. Settings, users, rules, and filter lists in `AdGuardH
 
 - **`syntax error` or a fetch error:** check router DNS and internet access with `:put [:resolve raw.githubusercontent.com]`. If certificate validation fails because of the CRL, add `check-certificate=yes-without-crl` to the fetch command.
 - **`Router DNS: fallback active` in the summary:** the container is not answering yet. Run the script again once it answers, or run `/system script run mikrotik-adguardhome-restore`.
-- **`Another run is in progress`:** a previous run was interrupted. Clear the lock with `:set AghLock ""`.
+- **`Another run is in progress`:** another run started within the last 20 minutes. If it was interrupted, wait or clear the lock with `:set AghLock ""`.
 - **Slow image pulls:** increase `cPullTimeout`.
 - **No container network:** verify the veth address, bridge membership, gateway, and masquerade rule.
 

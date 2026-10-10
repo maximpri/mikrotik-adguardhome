@@ -21,7 +21,7 @@ MARKER = "#SCRIPT-COMPLETE"
 # Function arguments and loop variables used inside helper functions.
 ARGS = {
     "containerName", "timeout", "poll", "progress", "command", "value", "path",
-    "mode", "src", "dst", "base", "image", "host", "server", "k", "v", "s", "f", "d", "i",
+    "mode", "src", "dst", "base", "image", "source", "key", "host", "server", "k", "v", "s", "f", "d", "i",
     "n", "c", "m", "p", "id", "sep", "mountId",
 }
 

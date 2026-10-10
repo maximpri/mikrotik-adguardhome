@@ -416,8 +416,9 @@
 :global AghLock
 :local uptimeNow [/system resource get uptime]
 :if ([:typeof $AghLock] = "time") do={
-    :if (($uptimeNow - $AghLock) < 01:00:00) do={
-        :put "  [FAILED] Another run started less than an hour ago and is still active."
+    ## A run takes at most about 15 minutes; an older lock is stale.
+    :if (($uptimeNow - $AghLock) < 00:20:00) do={
+        :put "  [FAILED] Another run started less than 20 minutes ago and is still active."
         :put "  If that run was interrupted, clear the lock with: :set AghLock \"\""
         :error "Another run is in progress"
     }
