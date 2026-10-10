@@ -30,6 +30,8 @@
 #   - RouterOS 7.22 or later with container support (ARM, ARM64, x86, or CHR)
 #   - USB storage mounted at /usb1 (or modify cDefaultStorageMount variable)
 #   - Network connectivity to Docker Hub
+#   - Not supported: EN7562CT devices (hEX Refresh) run only arm32v5
+#     images, which AdGuard Home does not publish
 #
 # Post-deployment steps (first-time only):
 #   1. Attach the veth interface to a container bridge
@@ -50,10 +52,13 @@
 :local cImage "adguard/adguardhome:latest"
 :local cInterface "agh"
 :local cDefaultStorageMount "/usb1"
+## Storage for the AdGuardHome.yaml config mount. Keep it on persistent
+## storage, such as internal flash, if cDefaultStorageMount is a RAM disk.
+:local cConfigStorageMount $cDefaultStorageMount
 :local cRootDir ($cDefaultStorageMount . "/agh")
 :local cTmpDir ($cDefaultStorageMount . "/tmp")
 :local cMountListName "agh_conf"
-:local cMountSrc ($cDefaultStorageMount . "/conf/agh")
+:local cMountSrc ($cConfigStorageMount . "/conf/agh")
 :local cMountDst "/opt/adguardhome/conf"
 :local cWorkMountSrc ($cDefaultStorageMount . "/work/agh")
 :local cWorkMountDst "/opt/adguardhome/work"
@@ -804,6 +809,7 @@
     :put ("  |-- cName=" . $cName)
     :put ("  |-- cImage=" . $cImage)
     :put ("  |-- cDefaultStorageMount=" . $cDefaultStorageMount)
+    :put ("  |-- cConfigStorageMount=" . $cConfigStorageMount)
     :put ("  |-- cRootDir=" . $cRootDir)
     :put ("  |-- cMountSrc=" . $cMountSrc)
     :put ("  |-- cInterface=" . $cInterface)
