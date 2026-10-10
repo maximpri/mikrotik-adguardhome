@@ -10,8 +10,10 @@ An idempotent RouterOS script that deploys and upgrades [AdGuard Home](https://a
 - Creates a statically addressed veth interface.
 - Performs first-time image pull, extraction, start, and stability checks.
 - Uses RouterOS 7.22+'s automatic stop/repull/start behavior for upgrades.
+- Keeps the router's own DNS working during upgrades when the router resolves through AdGuard Home.
 - Configures native container healthchecks on RouterOS 7.23 and later.
-- Preserves the router's DNS, static DNS records, firewall, and bridge configuration.
+- Preserves static DNS records, firewall, and bridge configuration, and restores the router's DNS settings after any temporary fallback.
+- Ends every run with a summary of the container state, address, router DNS, and next steps.
 
 ## Requirements
 
@@ -54,6 +56,7 @@ Edit the variables near the top of `adguardhome_script.rsc` before importing it:
 :local cConfigStorageMount $cDefaultStorageMount
 :local cContainerAddress "172.17.0.2/24"
 :local cContainerGateway "172.17.0.1"
+:local cFallbackDns "1.1.1.1"
 :local cPullTimeout 300
 :local cHealthcheckCmd "sh -c 'wget -q --spider http://127.0.0.1:3000 || wget -q --spider http://127.0.0.1:80'"
 ```
@@ -94,6 +97,26 @@ Running the deployment script again reconciles the healthcheck on containers cre
 
 The container is created with `logging=yes`, and RouterOS may record each probe in the container log. If that log is written to flash or USB storage, consider a longer `cHealthcheckInterval`.
 
+## Router DNS during upgrades
+
+If the router itself resolves through AdGuard Home, the router loses DNS as soon as `repull` stops the container, and the image pull then fails. The script handles this automatically. It is equivalent to doing these steps by hand:
+
+1. Add a temporary public resolver to the router's DNS servers.
+2. Run the deployment script.
+3. Remove the temporary resolver.
+4. Flush the router's DNS cache.
+
+The fallback applies only when `/ip dns` `servers` contains the container address, or `use-doh-server` points at it. In that case the script:
+
+1. Sets the router's DNS servers to `cFallbackDns` (default `1.1.1.1`) followed by your other servers, without the container. It clears `use-doh-server` if that points at the container.
+2. Flushes the DNS cache and runs the deployment.
+3. Waits up to `cDnsReadyTimeout` seconds for AdGuard Home to resolve `cDnsTestHost`.
+4. Restores the original servers and DoH setting exactly, then flushes the cache again so no unfiltered answers stay cached.
+
+If AdGuard Home does not answer, for example after a failed upgrade, the script keeps the fallback so the router stays online. It prints the exact commands to restore the original settings. Running the script again also restores them: the original values are kept in RouterOS global variables, so an interrupted run can be recovered until the next reboot.
+
+Set `cFallbackDns` to a comma-separated list to use several resolvers, or to `""` to disable the fallback. LAN clients that query AdGuard Home directly still have no DNS while the container restarts. Give them a secondary resolver if that downtime matters.
+
 ## Complete the network setup
 
 The script assigns `172.17.0.2/24` and gateway `172.17.0.1` to the `agh` veth. It deliberately does not change bridges or firewall rules because those are router-specific.
@@ -124,7 +147,9 @@ Run the script again. When the named container exists, it calls:
 /container repull [find name=adguardhome] remote-image=adguard/adguardhome:latest
 ```
 
-RouterOS 7.22 and later automatically stop, repull, and restart the container. The script waits up to five minutes by default and then verifies that the container remains running. On RouterOS 7.23 and later, it also applies the configured native healthcheck before repulling.
+RouterOS 7.22 and later automatically stop, repull, and restart the container. The script waits up to five minutes by default and then verifies that the container remains running. On RouterOS 7.23 and later, it also applies the configured native healthcheck before repulling. If the router's DNS depends on AdGuard Home, see [Router DNS during upgrades](#router-dns-during-upgrades).
+
+The script waits for the container to actually go down and come back. A brief `stopped` state between stopping and pulling is not mistaken for completion. If the container keeps running for `cRepullGraceSeconds` (default 60), the repull has not started: the script reports a warning instead of a success and keeps any DNS fallback in place. A pull that ends in an error state fails immediately instead of waiting for the full timeout.
 
 The persistent configuration and work-data mounts are retained. If an existing mount destination points to a different source directory, the script stops instead of silently switching data.
 
@@ -148,6 +173,10 @@ Check storage and DNS:
 :put [:resolve registry-1.docker.io]
 ```
 
+If the router was left on the fallback DNS, the run summary shows `Router DNS: fallback active`. Once AdGuard Home answers, run the script again, or apply the printed `/ip dns set` and `/ip dns cache flush` commands. Also run the printed `/system script environment remove` command, so a later run doesn't restore the saved settings again. The script also discards saved settings by itself if the router's DNS servers no longer begin with the fallback.
+
+A failed run ends with an error, so a calling script or scheduler can detect it. The summary shows the reason.
+
 If image extraction exceeds five minutes, increase `cPullTimeout`. If the container has no network access, verify the veth address, bridge membership, gateway address, and masquerade rule.
 
 ## Security notes
@@ -155,7 +184,7 @@ If image extraction exceeds five minutes, increase `cPullTimeout`. If the contai
 - Container support expands the router's attack surface. Keep RouterOS and AdGuard Home patched.
 - Do not expose the setup UI or DNS service to untrusted networks.
 - Review the image tag before upgrades; `latest` can change at any time.
-- The script does not overwrite router DNS servers or delete static DNS records.
+- The script does not delete static DNS records. It changes router DNS servers only temporarily, only when they point at AdGuard Home, and restores them once AdGuard Home answers.
 
 See MikroTik's [Container documentation](https://manual.mikrotik.com/docs/containers/) and [device-mode documentation](https://manual.mikrotik.com/docs/system-information-and-utilities/device-mode/) for platform details.
 
