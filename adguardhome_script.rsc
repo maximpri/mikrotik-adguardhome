@@ -1,147 +1,128 @@
 # ============================================================================
-# AdGuard Home Container Deployment Script for MikroTik RouterOS
+# AdGuard Home / Pi-hole Container Deployment Script for MikroTik RouterOS
 # ============================================================================
-# Version: 1.9.0
+# Version: 2.0.0
 # Author:  Maxim Priezjev
 # Date:    October 9, 2026
 # Minimum RouterOS: 7.22
 #
-# IMPORTANT: RouterOS 7.23+ supports native container healthchecks. RouterOS
-#            7.22 remains supported with the script's running/stability checks.
+# Installs, upgrades, or switches between AdGuard Home and Pi-hole as a
+# RouterOS container. Safe to run at any time:
+#   - The new image is pulled into a second container while the current one
+#     keeps serving DNS. If the image is unchanged, nothing is restarted.
+#   - The switch is verified (running, stable, answering DNS). On failure the
+#     previous container is started again (rollback).
+#   - If the router itself resolves through the container, a fallback DNS
+#     server is used during the switch and the original settings are restored
+#     once the container answers again.
 #
-# Description:
-#   This script automates the deployment and upgrade of AdGuard Home as a
-#   container on MikroTik routers. It handles both first-time installation
-#   and subsequent upgrades to the latest version.
-#
-# Features:
-#   - First-time setup: Configures the Docker registry, mount points, and
-#     veth interface, then pulls, extracts, and starts the container
-#   - Upgrade mode: Uses RouterOS 7.22+ automatic repull for in-place updates
-#   - Update-safe DNS: If the router itself resolves through AdGuard Home, a
-#     fallback resolver is used while the container is down, and the original
-#     DNS settings are restored once AdGuard Home answers again
-#   - Error handling: Every failure path restores DNS and prints a summary
-#   - Idempotent setup: Validates existing mounts, envs, and veth settings
-#   - Health monitoring: Configures native healthchecks on RouterOS 7.23+
+# Choose the app with cApp below, or before running:  :global DnsFilterApp "pihole"
+# For the one-line installer, see README.md. It loads this file into memory,
+# so keep the file under 60 KB.
 #
 # Prerequisites:
-#   - RouterOS 7.22 or later with container support (ARM, ARM64, x86, or CHR)
-#   - USB storage mounted at /usb1 (or modify cDefaultStorageMount variable)
-#   - Network connectivity to Docker Hub
-#   - Not supported: EN7562CT devices (hEX Refresh) run only arm32v5
-#     images, which AdGuard Home does not publish
-#
-# Post-deployment steps (first-time only):
-#   1. Attach the veth interface to a container bridge
-#   2. Assign 172.17.0.1/24 to that bridge and configure NAT/firewall rules
-#   3. Access AdGuard Home web UI (default: http://<container-ip>:3000)
-#   4. Complete initial AdGuard Home setup wizard
-#
-# Usage:
-#   /import adguardhome_script.rsc
-#   or
-#   /system script add name=adguardhome-deploy source=[/file get adguardhome_script.rsc contents]
-#   /system script run adguardhome-deploy
-#
+#   - RouterOS 7.22 or later with the container package (ARM, ARM64, x86, CHR)
+#   - Storage mounted at /usb1 (or change cDefaultStorageMount)
+#   - Not supported: EN7562CT devices (hEX Refresh) run only arm32v5 images
 # ============================================================================
 
 ## ========================================
 ## Settings
 ## ========================================
 
-:local cName "adguardhome"
-:local cImage "adguard/adguardhome:latest"
-:local cInterface "agh"
+## "adguard", "pihole", or "" to keep the installed app (AdGuard Home when
+## nothing is installed yet)
+:local cApp ""
+:local cAdguardImage "adguard/adguardhome:latest"
+:local cPiholeImage "pihole/pihole:latest"
+## Pi-hole web UI password. "" keeps the current one; a new install then gets
+## a random password shown in /container log.
+:local cPiholePassword ""
+
 :local cDefaultStorageMount "/usb1"
-## Storage for the AdGuardHome.yaml config mount. Keep it on persistent
-## storage, such as internal flash, if cDefaultStorageMount is a RAM disk.
+## Keep config on persistent storage if cDefaultStorageMount is a RAM disk.
 :local cConfigStorageMount $cDefaultStorageMount
-:local cRootDir ($cDefaultStorageMount . "/agh")
-:local cTmpDir ($cDefaultStorageMount . "/tmp")
-:local cMountListName "agh_conf"
-:local cMountSrc ($cConfigStorageMount . "/conf/agh")
-:local cMountDst "/opt/adguardhome/conf"
-:local cWorkMountSrc ($cDefaultStorageMount . "/work/agh")
-:local cWorkMountDst "/opt/adguardhome/work"
-:local cEnvListName "AGH"
-:local cRegistryUrl "https://registry-1.docker.io"
-:local cRegistryHost "registry-1.docker.io"
+:local cInterface "agh"
 :local cContainerAddress "172.17.0.2/24"
 :local cContainerGateway "172.17.0.1"
+:local cRegistryUrl "https://registry-1.docker.io"
+:local cRegistryHost "registry-1.docker.io"
+:local cTmpDir ($cDefaultStorageMount . "/tmp")
 
-## Update-safe DNS. When the router's DNS servers (or DoH server) point at the
-## AdGuard Home container, these resolvers are used while it is down. Use a
-## comma-separated list, or "" to disable the fallback.
+## Fallback resolvers used while the router's DNS server is switching
+## (comma-separated; "" disables) and the name used to test DNS.
 :local cFallbackDns "1.1.1.1"
-## Name resolved through AdGuard Home before the original DNS is restored.
 :local cDnsTestHost "cloudflare.com"
 
-## RouterOS 7.23+ native healthcheck configuration. The default command covers
-## both the first-run setup UI (port 3000) and the normal web UI (port 80).
-## Change this command if AdGuard Home uses a custom web port. The command is
-## embedded in a double-quoted RouterOS string, so avoid unescaped " and $.
-:local cHealthcheckCmd "sh -c 'wget -q --spider http://127.0.0.1:3000 || wget -q --spider http://127.0.0.1:80'"
+## RouterOS 7.23+ native healthcheck timing
 :local cHealthcheckInterval "00:00:30"
 :local cHealthcheckTimeout "00:00:10"
 :local cHealthcheckStartPeriod "00:02:00"
 :local cHealthcheckRetries 3
 
-## Timeouts in seconds (increase for slow USB storage or slow links)
-:local cPullTimeout 300
+## Timeouts in seconds
+:local cPullTimeout 600
 :local cStartTimeout 30
+:local cStopTimeout 30
 :local cStabilitySeconds 10
-:local cDnsReadyTimeout 60
+:local cDnsReadyTimeout 90
 :local cPollSeconds 5
 :local cProgressSeconds 30
-## If repull has not visibly stopped the container after this many seconds,
-## the script stops waiting and reports a warning.
-:local cRepullGraceSeconds 60
 
 ## ========================================
-## Internal state (do not edit)
+## Internal state
 ## ========================================
 
-:local cScriptVersion "1.9.0"
-:local cMinimumMinorVersion 22
-:local cHealthcheckMinorVersion 23
+:local cScriptVersion "2.0.0"
 :local stepNum 0
 :local stepTotal 9
 :local currentStep ""
 :local deploymentSuccess true
 :local failReason ""
+:local resultText ""
 :local warningCount 0
-:local containerExists false
 :local containerIp ""
 :local healthcheckSupported false
 :local healthcheckConfigured false
+## Container that serves DNS right now; updated only after a verified switch.
+:local servingName ""
 
-## DNS fallback state. Globals let a later run restore DNS settings if this
-## run is interrupted while the fallback is active.
-:global AGHDnsRestorePending
-:global AGHDnsRestoreServers
-:global AGHDnsRestoreDoh
-:global AGHDnsRestoreDohUsed
+## App profile (filled in step 2)
+:local appId ""
+:local appTitle ""
+:local appBase ""
+:local appImage ""
+:local appRootDir ""
+:local appMountList ""
+:local appConfSrc ""
+:local appConfDst ""
+:local appWorkSrc ""
+:local appWorkDst ""
+:local appEnvList ""
+:local appProbe ""
+:local appTagProbe ""
+:local appConfigFile ""
+:local appHealthcheckCmd ""
+
+## DNS fallback state. While the fallback is active, the original settings
+## are kept in this /system script, which survives reboots, lets a later run
+## recover an interrupted one, and restores DNS when run by hand.
+:local cRestoreScript "dns-filter-restore"
 :local dnsFallbackActive false
 :local dnsOriginalServers ""
 :local dnsOriginalDoh ""
 :local dnsDohUsesContainer false
-:local dnsKeepFallback false
 :local dnsStatus "unchanged"
-:local pollDelay [:totime ($cPollSeconds . "s")]
 
 ## ========================================
 ## Helper functions
 ## ========================================
-## RouterOS functions cannot see the caller's locals, so every input is passed
-## as a named argument.
+## Functions cannot see the caller's locals; all inputs are arguments.
 
 ## Returns missing, error, extracting, running, stopped, or other.
 :local getContainerState do={
     :local items [/container print as-value where name=$containerName]
-    :if ([:len $items] = 0) do={
-        :return "missing"
-    }
+    :if ([:len $items] = 0) do={ :return "missing" }
     :local isRunning false
     :local isStopped false
     :local isExtracting false
@@ -159,42 +140,127 @@
     :return "other"
 }
 
-## Starts the container and waits until it reports running.
-:local startContainer do={
-    :local started false
-    ## A rejected request can mean RouterOS is already starting it, so the
-    ## state is polled either way.
-    :do {
-        /container start [find name=$containerName]
-    } on-error={
-        :put "      |   |-- [INFO] RouterOS rejected the start request; checking state"
-    }
-    :local waited 0
+## Waits until a new container finishes extracting. Returns the final state.
+:local waitForExtraction do={
+    :local state "other"
+    :local lastState ""
+    :local elapsed 0
     :local limit [:tonum $timeout]
-    :while ($started = false && $waited < $limit) do={
+    :local step [:tonum $poll]
+    :while ($state != "stopped" && $state != "running" && $state != "error" && \
+        $state != "missing" && $elapsed < $limit) do={
+        :delay [:totime ($step . "s")]
+        :set elapsed ($elapsed + $step)
+        :set state "other"
+        :local items [/container print as-value where name=$containerName]
+        :if ([:len $items] = 0) do={
+            :set state "missing"
+        } else={
+            :local status ""
+            :foreach k,v in=($items->0) do={
+                :if ($k = "extracting" && $v = true) do={ :set state "extracting" }
+                :if ($k = "stopped" && $v = true && $state = "other") do={ :set state "stopped" }
+                :if ($k = "running" && $v = true) do={ :set state "running" }
+                :if ($k = "status") do={ :set status [:tostr $v] }
+            }
+            :if ([:typeof [:find $status "error"]] = "num") do={ :set state "error" }
+            :if ($state = "other" && [:len $status] > 0) do={ :set state $status }
+        }
+        :if ($state != $lastState || ($elapsed % [:tonum $progress]) = 0) do={
+            :put ("      |   |-- " . $elapsed . "s: " . $state)
+            :set lastState $state
+        }
+    }
+    :return $state
+}
+
+## Starts a container and waits until it is running. A rejected request can
+## mean RouterOS is already starting it, so the state is polled either way.
+:local startContainer do={
+    :do { /container start [find name=$containerName] } on-error={ }
+    :local started false
+    :local waited 0
+    :while ($started = false && $waited < [:tonum $timeout]) do={
         :delay 2s
         :set waited ($waited + 2)
         :local items [/container print as-value where name=$containerName]
+        :local isStopped false
         :if ([:len $items] > 0) do={
             :foreach k,v in=($items->0) do={
                 :if ($k = "running" && $v = true) do={ :set started true }
                 :if ($k = "status" && [:tostr $v] = "running") do={ :set started true }
+                :if ($k = "stopped" && $v = true) do={ :set isStopped true }
+                :if ($k = "status" && [:tostr $v] = "stopped") do={ :set isStopped true }
             }
+        }
+        ## A container that was still stopping rejected the first request.
+        :if ($started = false && $isStopped = true) do={
+            :do { /container start [find name=$containerName] } on-error={ }
         }
     }
     :return $started
 }
 
-## Prints container properties and troubleshooting commands.
+## Ranks how active a container is: 2 running, 1 starts on boot, 0 neither.
+:local appScore do={
+    :if ([:len $containerName] = 0) do={ :return 0 }
+    :local items [/container print as-value where name=$containerName]
+    :if ([:len $items] = 0) do={ :return 0 }
+    :local score 0
+    :foreach k,v in=($items->0) do={
+        :if ($k = "start-on-boot" && $v = true && $score < 1) do={ :set score 1 }
+        :if ($k = "running" && $v = true) do={ :set score 2 }
+        :if ($k = "status" && [:tostr $v] = "running") do={ :set score 2 }
+    }
+    :return $score
+}
+
+## Stops a container and waits until it is stopped (or gone).
+:local stopContainer do={
+    :do { /container stop [find name=$containerName] } on-error={ }
+    :local stopped false
+    :local waited 0
+    :while ($stopped = false && $waited < [:tonum $timeout]) do={
+        :delay 2s
+        :set waited ($waited + 2)
+        :local items [/container print as-value where name=$containerName]
+        :if ([:len $items] = 0) do={
+            :set stopped true
+        } else={
+            :foreach k,v in=($items->0) do={
+                :if ($k = "stopped" && $v = true) do={ :set stopped true }
+                :if ($k = "status" && [:tostr $v] = "stopped") do={ :set stopped true }
+            }
+        }
+    }
+    :return $stopped
+}
+
+## Returns true once the server answers a DNS query (one try if timeout=0).
+:local dnsAnswers do={
+    :local ok false
+    :local waited 0
+    :local limit [:tonum $timeout]
+    :while ($ok = false && $waited <= $limit) do={
+        :do {
+            :resolve $host server=$server
+            :set ok true
+        } on-error={
+            :set waited ($waited + 3)
+            :if ($waited <= $limit) do={ :delay 3s }
+        }
+    }
+    :return $ok
+}
+
+## Prints container properties and the log command.
 :local printContainerDetails do={
     :local items [/container print as-value where name=$containerName]
     :if ([:len $items] > 0) do={
-        :put "      |   |-- Container properties:"
         :foreach k,v in=($items->0) do={
             :put ("      |   |     " . $k . "=" . [:tostr $v])
         }
     }
-    :put "      |   |-- Run: /container print detail"
     :put ("      |   |-- Run: /container log " . $containerName)
 }
 
@@ -217,269 +283,382 @@
     :return $out
 }
 
+## Converts a RouterOS path to a /file name (no leading slash).
+:local filePath do={
+    :local p [:tostr $path]
+    :if ([:pick $p 0 1] = "/") do={ :set p [:pick $p 1 [:len $p]] }
+    :while ([:len $p] > 0 && [:pick $p ([:len $p] - 1)] = "/") do={
+        :set p [:pick $p 0 ([:len $p] - 1)]
+    }
+    :return $p
+}
+
+## Returns a file's size or contents as a string, or "" if it is missing.
+:local fileInfo do={
+    :local ids [/file find where name=$path]
+    :if ([:len $ids] = 0) do={ :return "" }
+    :if ($mode = "contents") do={ :return [:tostr [/file get ($ids->0) contents]] }
+    :return [:tostr [/file get ($ids->0) size]]
+}
+
+## Copies a small text file (under 60 KB) and verifies the copy's size.
+:local copySmallFile do={
+    :local ids [/file find where name=$src]
+    :if ([:len $ids] = 0) do={ :return false }
+    :local size [/file get ($ids->0) size]
+    :if ($size > 60000) do={ :return false }
+    :local data [/file get ($ids->0) contents]
+    :if ([:len $data] != $size) do={ :return false }
+    :local written false
+    :do {
+        :local oldIds [/file find where name=$dst]
+        :if ([:len $oldIds] > 0) do={
+            /file set ($oldIds->0) contents=$data
+        } else={
+            /file add name=$dst contents=$data
+        }
+        :set written true
+    } on-error={ }
+    :if ($written = false) do={ :return false }
+    :delay 1s
+    :local copyIds [/file find where name=$dst]
+    :if ([:len $copyIds] = 0) do={ :return false }
+    :return ([/file get ($copyIds->0) size] = $size)
+}
+
+## Returns the live container of an app (base or base-next), or "". With
+## both present, the running one wins, then the one that starts on boot.
+:local findLive do={
+    :local candidates [:toarray ""]
+    :set candidates ($candidates, $base)
+    :set candidates ($candidates, ($base . "-next"))
+    :local names [:toarray ""]
+    :foreach n in=$candidates do={
+        :if ([:len [/container find where name=$n]] > 0) do={ :set names ($names, $n) }
+    }
+    :if ([:len $names] = 0) do={ :return "" }
+    :if ([:len $names] = 1) do={ :return ($names->0) }
+    :local chosen ""
+    :foreach n in=$names do={
+        :local items [/container print as-value where name=$n]
+        :foreach k,v in=($items->0) do={
+            :if ($k = "running" && $v = true && [:len $chosen] = 0) do={ :set chosen $n }
+        }
+    }
+    :if ([:len $chosen] > 0) do={ :return $chosen }
+    :foreach n in=$names do={
+        :if ([/container get [find where name=$n] start-on-boot] = true && [:len $chosen] = 0) do={
+            :set chosen $n
+        }
+    }
+    :if ([:len $chosen] > 0) do={ :return $chosen }
+    :return ($names->0)
+}
+
 ## Applies the 7.23+ healthcheck without blocking deployment.
 :local applyHealthcheck do={
     :local configured false
-    :put "      |-- Configuring native healthcheck..."
     :do {
         :local setHealthcheck [:parse $command]
         $setHealthcheck
         :set configured true
-        :put "      |   |-- [OK] Healthcheck configured"
+        :put "      |   |-- [OK] Native healthcheck configured"
     } on-error={
         :put "      |   |-- [WARNING] RouterOS rejected the healthcheck settings"
-        :put "      |   |-- Continuing with running/stability checks only"
-        :log warning "AdGuard Home: native healthcheck configuration failed"
+        :log warning "DNS filter: native healthcheck configuration failed"
     }
     :return $configured
 }
 
 ## ========================================
-## Header
+## Header, lock, and version check
 ## ========================================
 
 :put ""
 :put "========================================"
-:put ("  AdGuard Home Deployment v" . $cScriptVersion)
+:put ("  AdGuard Home / Pi-hole Deployment v" . $cScriptVersion)
 :put "========================================"
-:put ""
 
-## ========================================
-## Step 1: RouterOS Version Check
-## ========================================
-## Runs before anything is changed, so it can stop the script directly.
+## Prevent overlapping runs (for example a scheduler and a manual run).
+:global DnsFilterLock
+:local uptimeNow [/system resource get uptime]
+:if ([:typeof $DnsFilterLock] = "time") do={
+    :if (($uptimeNow - $DnsFilterLock) < 01:00:00) do={
+        :put "  [FAILED] Another run started less than an hour ago and is still active."
+        :put "  If that run was interrupted, clear the lock with: :set DnsFilterLock \"\""
+        :error "Another run is in progress"
+    }
+}
+:set DnsFilterLock $uptimeNow
+
+## :global DnsFilterApp overrides cApp for this run only.
+:global DnsFilterApp
+:if ([:typeof $DnsFilterApp] = "str" && [:len $DnsFilterApp] > 0) do={
+    :set cApp $DnsFilterApp
+}
+:global DnsFilterForce
+:local forceSwitch ($DnsFilterForce = "yes")
+:do { /system script environment remove [find where name="DnsFilterApp" or name="DnsFilterForce"] } on-error={ }
 
 :set stepNum ($stepNum + 1)
+:put ""
 :put ("[" . $stepNum . "/" . $stepTotal . "] RouterOS version...")
 
 :local rosVersion [/system resource get version]
 :local versionClean $rosVersion
 :local spacePos [:find $rosVersion " "]
-:if ([:typeof $spacePos] != "nil") do={
-    :set versionClean [:pick $rosVersion 0 $spacePos]
-}
-
+:if ([:typeof $spacePos] != "nil") do={ :set versionClean [:pick $rosVersion 0 $spacePos] }
 :local firstDot [:find $versionClean "."]
-:local majorVersion [:pick $versionClean 0 $firstDot]
-:local afterFirstDot [:pick $versionClean ($firstDot + 1) [:len $versionClean]]
-:local secondDot [:find $afterFirstDot "."]
-:local minorVersion $afterFirstDot
-:if ([:typeof $secondDot] != "nil") do={
-    :set minorVersion [:pick $afterFirstDot 0 $secondDot]
-}
-
+:local majorNumber [:tonum [:pick $versionClean 0 $firstDot]]
 ## Keep only the leading digits so pre-releases such as 7.23rc1 parse as 23.
 :local minorDigits ""
-:local minorDigitsDone false
-:if ([:len $minorVersion] > 0) do={
-    :for i from=0 to=([:len $minorVersion] - 1) do={
-        :local ch [:pick $minorVersion $i]
-        :if ($minorDigitsDone = false && [:typeof [:find "0123456789" $ch]] = "num") do={
-            :set minorDigits ($minorDigits . $ch)
-        } else={
-            :set minorDigitsDone true
-        }
+:local minorDone false
+:for i from=($firstDot + 1) to=([:len $versionClean] - 1) do={
+    :local ch [:pick $versionClean $i]
+    :if ($minorDone = false && [:typeof [:find "0123456789" $ch]] = "num") do={
+        :set minorDigits ($minorDigits . $ch)
+    } else={
+        :set minorDone true
     }
 }
-:if ([:len $minorDigits] = 0) do={
-    :set minorDigits "0"
-}
-
-:local majorNumber [:tonum $majorVersion]
+:if ([:len $minorDigits] = 0) do={ :set minorDigits "0" }
 :local minorNumber [:tonum $minorDigits]
 
 :put ("      |-- Detected: " . $rosVersion)
-:if (!($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= $cMinimumMinorVersion))) do={
-    :put ("      |-- [FAILED] RouterOS 7." . $cMinimumMinorVersion . " or later is required")
-    :put "      |-- Fix: Upgrade RouterOS and the container package"
-    :log error ("AdGuard Home: RouterOS " . $rosVersion . " is not supported (requires 7.22 or later)")
+:if (!($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= 22))) do={
+    :put "      |-- [FAILED] RouterOS 7.22 or later is required"
+    :set DnsFilterLock ""
+    :log error ("DNS filter: RouterOS " . $rosVersion . " is not supported")
     :error "Version check failed"
 }
-
-:if ($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= $cHealthcheckMinorVersion)) do={
+:if ($majorNumber > 7 || ($majorNumber = 7 && $minorNumber >= 23)) do={
     :set healthcheckSupported true
-    :put "      |-- [OK] Supported; native container healthchecks available"
+    :put "      |-- [OK] Supported; native healthchecks available"
 } else={
-    :put "      |-- [OK] Supported; native healthchecks need 7.23+ (using stability checks)"
-}
-
-## Keep 7.23-only properties inside a runtime-parsed command. This prevents
-## RouterOS 7.22 from rejecting the script while parsing an unreachable branch.
-:local healthcheckSetCommand ""
-:if ($healthcheckSupported = true) do={
-    :set healthcheckSetCommand ("/container set [find name=\"" . $cName . "\"]" . \
-        " healthcheck-cmd=\"" . $cHealthcheckCmd . "\"" . \
-        " healthcheck-interval=\"" . $cHealthcheckInterval . "\"" . \
-        " healthcheck-timeout=\"" . $cHealthcheckTimeout . "\"" . \
-        " healthcheck-start-period=\"" . $cHealthcheckStartPeriod . "\"" . \
-        " healthcheck-retries=" . $cHealthcheckRetries)
-}
-
-:if ([:len [/container find name=$cName]] > 0) do={
-    :set containerExists true
-    :log info ("AdGuard Home: upgrade started (script v" . $cScriptVersion . ")")
-} else={
-    :log info ("AdGuard Home: first-time deployment started (script v" . $cScriptVersion . ")")
+    :put "      |-- [OK] Supported; native healthchecks need 7.23+"
 }
 
 ## ========================================
 ## Steps 2-9
 ## ========================================
-## Every failure below sets failReason and raises an error, which is caught at
-## the end of this block so the DNS fallback can always be restored.
+## Every failure sets failReason and raises an error, caught at the end of
+## this block so the router DNS is always restored.
 
 :do {
 
-    ## ----------------------------------------
-    ## Step 2: Container package and device-mode
-    ## ----------------------------------------
-
+    ## ---------- Step 2: Container support and app ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Container support"
-    :put ("[" . $stepNum . "/" . $stepTotal . "] Container support...")
+    :put ("[" . $stepNum . "/" . $stepTotal . "] Container support and app...")
 
     :if ([:len [/system package find where name="container" and disabled=no]] = 0) do={
-        :if ([:len [/system package find where name="container"]] > 0) do={
-            :put "      |-- [FAILED] The container package is disabled"
-            :put "      |-- Fix: /system package enable container, then reboot"
-        } else={
-            :put "      |-- [FAILED] The container package is not installed"
-            :put "      |-- Fix: Install the container package for your RouterOS version"
-        }
+        :put "      |-- [FAILED] The container package is not installed or is disabled"
         :set failReason "Container package unavailable"
         :error $failReason
     }
-    :put "      |-- [OK] Container package installed and enabled"
-
     :if ([/system/device-mode get container] != true) do={
-        :put "      |-- Enabling container device-mode..."
         /system/device-mode/update container=yes
-        :put "      |-- [ACTION REQUIRED] Confirm within the activation window"
-        :put "      |-- Briefly press the reset/mode button, or perform a cold power cycle"
-        :put "      |-- Run this script again after RouterOS restarts"
+        :put "      |-- [ACTION REQUIRED] Press the reset/mode button or cold-reboot to"
+        :put "      |   |   confirm container device-mode, then run this script again"
         :set failReason "Physical device-mode confirmation required"
         :error $failReason
     }
-    :put "      |-- [OK] Container device-mode enabled"
+    :put "      |-- [OK] Container package and device-mode enabled"
 
-    ## ----------------------------------------
-    ## Step 3: Storage
-    ## ----------------------------------------
+    :local adguardLive [$findLive base="adguardhome"]
+    :local piholeLive [$findLive base="pihole"]
+    :if ($cApp = "adguardhome") do={ :set cApp "adguard" }
+    :if ($cApp = "pi-hole") do={ :set cApp "pihole" }
+    :local adguardScore [$appScore containerName=$adguardLive]
+    :local piholeScore [$appScore containerName=$piholeLive]
+    :if ([:len $cApp] = 0) do={
+        ## Keep the installed app: the running one, else the one that starts
+        ## on boot. A container kept stopped by an earlier switch never wins.
+        :set cApp "adguard"
+        :if ([:len $piholeLive] > 0 && ([:len $adguardLive] = 0 || $piholeScore > $adguardScore)) do={
+            :set cApp "pihole"
+        }
+    }
 
+    :local liveName ""
+    :local otherLive ""
+    :local liveScore 0
+    :local otherScore 0
+    :if ($cApp = "adguard") do={
+        :set appId "adguard"
+        :set appTitle "AdGuard Home"
+        :set appBase "adguardhome"
+        :set appImage $cAdguardImage
+        :set appRootDir ($cDefaultStorageMount . "/agh")
+        :set appMountList "agh_conf"
+        :set appConfSrc ($cConfigStorageMount . "/conf/agh")
+        :set appConfDst "/opt/adguardhome/conf"
+        :set appWorkSrc ($cDefaultStorageMount . "/work/agh")
+        :set appWorkDst "/opt/adguardhome/work"
+        :set appEnvList "AGH"
+        :set appProbe "opt/adguardhome/AdGuardHome"
+        :set appConfigFile "AdGuardHome.yaml"
+        :set appHealthcheckCmd "sh -c 'wget -q --spider http://127.0.0.1:3000 || wget -q --spider http://127.0.0.1:80'"
+        :set liveName $adguardLive
+        :set otherLive $piholeLive
+        :set liveScore $adguardScore
+        :set otherScore $piholeScore
+    }
+    :if ($cApp = "pihole") do={
+        :set appId "pihole"
+        :set appTitle "Pi-hole"
+        :set appBase "pihole"
+        :set appImage $cPiholeImage
+        :set appRootDir ($cDefaultStorageMount . "/pihole")
+        :set appMountList "pihole_conf"
+        :set appConfSrc ($cConfigStorageMount . "/conf/pihole")
+        :set appConfDst "/etc/pihole"
+        :set appEnvList "PIHOLE"
+        :set appProbe "usr/bin/pihole-FTL"
+        :set appTagProbe "pihole.docker.tag"
+        :set appConfigFile "pihole.toml"
+        :set appHealthcheckCmd "sh -c 'dig +short +norecurse +retry=0 @127.0.0.1 pi.hole || exit 1'"
+        :set liveName $piholeLive
+        :set otherLive $adguardLive
+        :set liveScore $piholeScore
+        :set otherScore $adguardScore
+    }
+    :if ([:len $appId] = 0) do={
+        :put ("      |-- [FAILED] Unknown app '" . $cApp . "'; use adguard or pihole")
+        :set failReason "Unknown app"
+        :error $failReason
+    }
+
+    ## The container being replaced: this app's live container, or the other
+    ## app's when switching. If this app's container was kept stopped by an
+    ## earlier switch while the other app serves, this is a switch back.
+    :local oldName $liveName
+    :local switchingApps false
+    :local staleName ""
+    :if ([:len $otherLive] > 0) do={
+        :if ([:len $liveName] = 0) do={
+            :set oldName $otherLive
+            :set switchingApps true
+        } else={
+            :if ($otherScore > $liveScore) do={
+                :set staleName $liveName
+                :set oldName $otherLive
+                :set switchingApps true
+            }
+        }
+    }
+    :set servingName $oldName
+    :if ($switchingApps = true) do={
+        :put ("      |-- App: " . $appTitle . " (switching from '" . $oldName . "')")
+    } else={
+        :if ([:len $liveName] > 0) do={
+            :put ("      |-- App: " . $appTitle . " (installed as '" . $liveName . "')")
+        } else={
+            :put ("      |-- App: " . $appTitle . " (new install)")
+        }
+    }
+
+    ## ---------- Step 3: Storage ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Storage"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Storage...")
 
-    ## /disk shows mount points without the leading slash ("usb1", not "/usb1").
-    :local diskName $cDefaultStorageMount
-    :if ([:pick $diskName 0 1] = "/") do={
-        :set diskName [:pick $diskName 1 [:len $diskName]]
-    }
-
+    :local diskName [$filePath path=$cDefaultStorageMount]
     :local storageOk false
     :do {
-        :if ([:len [/disk find where mount-point=$diskName]] > 0) do={
-            :set storageOk true
-        }
+        :if ([:len [/disk find where mount-point=$diskName]] > 0) do={ :set storageOk true }
     } on-error={ }
     :if ($storageOk = false && [:len [/file find where name=$diskName]] > 0) do={
         :set storageOk true
     }
-
     :if ($storageOk = false) do={
-        :put ("      |-- [FAILED] " . $cDefaultStorageMount . " is not mounted")
-        :put "      |-- Available mounts:"
+        :put ("      |-- [FAILED] " . $cDefaultStorageMount . " is not mounted. Available:")
         :foreach d in=[/disk find] do={
             :local mp [/disk get $d mount-point]
-            :if ([:len $mp] > 0) do={
-                :put ("      |   |-- /" . $mp)
-            }
+            :if ([:len $mp] > 0) do={ :put ("      |   |-- /" . $mp) }
         }
         :put "      |-- Fix: Edit cDefaultStorageMount near the top of this script"
         :set failReason ("Storage " . $cDefaultStorageMount . " not found")
         :error $failReason
     }
     :put ("      |-- [OK] " . $cDefaultStorageMount . " is mounted")
-    :put ("      |-- Container root: " . $cRootDir)
-    :put ("      |-- Config:         " . $cMountSrc)
-    :put ("      |-- Work data:      " . $cWorkMountSrc)
+    :put ("      |-- Config: " . $appConfSrc)
 
-    ## ----------------------------------------
-    ## Step 4: Router DNS and Docker Hub access
-    ## ----------------------------------------
-
+    ## ---------- Step 4: Router DNS ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Router DNS"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Router DNS and Docker Hub access...")
 
-    ## The container's address comes from the existing veth when there is one,
-    ## because the script preserves custom veth addressing.
+    ## The container address comes from the veth when it exists, because the
+    ## script keeps custom veth addressing.
     :set containerIp $cContainerAddress
     :local vethIdsForIp [/interface veth find name=$cInterface]
     :if ([:len $vethIdsForIp] > 0) do={
         :local vethAddress [:tostr [/interface veth get ($vethIdsForIp->0) address]]
-        :if ([:len $vethAddress] > 0) do={
-            :set containerIp $vethAddress
-        }
+        :if ([:len $vethAddress] > 0) do={ :set containerIp $vethAddress }
     }
     :foreach sep in={";";",";"/"} do={
         :local sepPos [:find $containerIp $sep]
-        :if ([:typeof $sepPos] = "num") do={
-            :set containerIp [:pick $containerIp 0 $sepPos]
-        }
+        :if ([:typeof $sepPos] = "num") do={ :set containerIp [:pick $containerIp 0 $sepPos] }
     }
 
-    ## Read the current DNS settings, or the originals saved by an
-    ## interrupted run that left the fallback active.
     :local serversUseContainer false
     :local currentServers [$splitList value=[/ip dns get servers]]
     :local fallbackList [$splitList value=$cFallbackDns]
 
-    ## Saved settings are used only while the fallback is still in place. If
-    ## DNS was changed since then, the saved values are stale and discarded.
-    :if ($AGHDnsRestorePending = "yes") do={
-        :if ([:len $currentServers] = 0 || [:len $fallbackList] = 0 || \
-            ($currentServers->0) != ($fallbackList->0)) do={
-            :set AGHDnsRestorePending "no"
+    ## Settings saved by an earlier run (comment: servers|dohUsed|temp|doh)
+    ## are used only while the temporary list it installed is still in place.
+    :local currentJoined ""
+    :foreach s in=$currentServers do={
+        :if ([:len $currentJoined] > 0) do={ :set currentJoined ($currentJoined . ",") }
+        :set currentJoined ($currentJoined . $s)
+    }
+    :local saved ""
+    :local savedIds [/system script find where name=$cRestoreScript]
+    :if ([:len $savedIds] > 0) do={
+        :set saved [:tostr [/system script get ($savedIds->0) comment]]
+        :local p1 [:find $saved "|"]
+        :local p2
+        :local p3
+        :if ([:typeof $p1] = "num") do={ :set p2 [:find $saved "|" ($p1 + 1)] }
+        :if ([:typeof $p2] = "num") do={ :set p3 [:find $saved "|" ($p2 + 1)] }
+        :if ([:typeof $p3] != "num") do={
+            :set saved ""
+        } else={
+            :if ([:pick $saved ($p2 + 1) $p3] != $currentJoined) do={ :set saved "" }
+        }
+        :if ([:len $saved] = 0) do={
+            /system script remove $savedIds
             :put "      |-- [INFO] Discarded stale DNS recovery data"
+        } else={
+            :set dnsOriginalServers [:pick $saved 0 $p1]
+            :set dnsDohUsesContainer ([:pick $saved ($p1 + 1) $p2] = "yes")
+            :set dnsOriginalDoh [:pick $saved ($p3 + 1) [:len $saved]]
         }
     }
-
-    :if ($AGHDnsRestorePending = "yes") do={
-        :set dnsOriginalServers [:tostr $AGHDnsRestoreServers]
-        :set dnsOriginalDoh [:tostr $AGHDnsRestoreDoh]
-        :set dnsDohUsesContainer ($AGHDnsRestoreDohUsed = "yes")
+    :if ([:len $saved] > 0) do={
         :set serversUseContainer true
-        :put "      |-- [INFO] Recovering DNS settings saved by an interrupted run"
-        :put ("      |   |-- Original servers: " . $dnsOriginalServers)
+        :put ("      |-- [INFO] Recovering DNS settings from an interrupted run: " . $dnsOriginalServers)
     } else={
         :foreach s in=$currentServers do={
-            :if ([:len $dnsOriginalServers] > 0) do={
-                :set dnsOriginalServers ($dnsOriginalServers . ",")
-            }
+            :if ([:len $dnsOriginalServers] > 0) do={ :set dnsOriginalServers ($dnsOriginalServers . ",") }
             :set dnsOriginalServers ($dnsOriginalServers . $s)
-            :if ($s = $containerIp) do={
-                :set serversUseContainer true
-            }
+            :if ($s = $containerIp) do={ :set serversUseContainer true }
         }
         :set dnsOriginalDoh [:tostr [/ip dns get use-doh-server]]
-        :if ([:len $dnsOriginalDoh] > 0) do={
-            :if ([:typeof [:find $dnsOriginalDoh ("//" . $containerIp . "/")]] = "num" || \
-                [:typeof [:find $dnsOriginalDoh ("//" . $containerIp . ":")]] = "num") do={
-                :set dnsDohUsesContainer true
-            }
+        :if ([:typeof [:find $dnsOriginalDoh ("//" . $containerIp . "/")]] = "num" || \
+            [:typeof [:find $dnsOriginalDoh ("//" . $containerIp . ":")]] = "num") do={
+            :set dnsDohUsesContainer true
         }
     }
 
     :if ($serversUseContainer = true || $dnsDohUsesContainer = true) do={
-        :put ("      |-- Router DNS resolves through AdGuard Home (" . $containerIp . ")")
-        :if ([:len $cFallbackDns] = 0) do={
-            :put "      |-- [WARNING] cFallbackDns is empty; the router has no DNS while"
-            :put "      |   |   the container is stopped, so the image pull may fail"
+        :put ("      |-- Router DNS resolves through the container (" . $containerIp . ")")
+        :if ([:len $fallbackList] = 0) do={
+            :put "      |-- [WARNING] cFallbackDns is empty; router DNS stops during a switch"
             :set warningCount ($warningCount + 1)
         } else={
-            ## Fallback resolvers first, then the original servers except the
-            ## container itself, so lookups do not wait on a stopped resolver.
+            ## Fallback first, then the other original servers (not the container).
             :local tempServers ""
             :foreach f in=$fallbackList do={
                 :if ([:len $tempServers] > 0) do={ :set tempServers ($tempServers . ",") }
@@ -487,36 +666,32 @@
             }
             :foreach s in=[$splitList value=$dnsOriginalServers] do={
                 :local skip ($s = $containerIp)
-                :foreach f in=$fallbackList do={
-                    :if ($f = $s) do={ :set skip true }
-                }
-                :if ($skip = false) do={
-                    :set tempServers ($tempServers . "," . $s)
-                }
+                :foreach f in=$fallbackList do={ :if ($f = $s) do={ :set skip true } }
+                :if ($skip = false) do={ :set tempServers ($tempServers . "," . $s) }
             }
-
-            :set AGHDnsRestoreServers $dnsOriginalServers
-            :set AGHDnsRestoreDoh $dnsOriginalDoh
+            :local dohUsedFlag "no"
+            :local restoreSource ("/ip dns set servers=\"" . $dnsOriginalServers . "\"")
             :if ($dnsDohUsesContainer = true) do={
-                :set AGHDnsRestoreDohUsed "yes"
-            } else={
-                :set AGHDnsRestoreDohUsed "no"
+                :set dohUsedFlag "yes"
+                :set restoreSource ($restoreSource . "; /ip dns set use-doh-server=\"" . $dnsOriginalDoh . "\"")
             }
-            :set AGHDnsRestorePending "yes"
+            :set restoreSource ($restoreSource . "; /ip dns cache flush; /system script remove [find name=\"" . \
+                $cRestoreScript . "\"]")
+            :do { /system script remove [find where name=$cRestoreScript] } on-error={ }
+            /system script add name=$cRestoreScript source=$restoreSource \
+                comment=($dnsOriginalServers . "|" . $dohUsedFlag . "|" . $tempServers . "|" . $dnsOriginalDoh)
 
             /ip dns set servers=$tempServers
             :set dnsFallbackActive true
             :set dnsStatus ("fallback active (" . $tempServers . ")")
-            :if ($dnsDohUsesContainer = true) do={
-                /ip dns set use-doh-server=""
-            }
+            :if ($dnsDohUsesContainer = true) do={ /ip dns set use-doh-server="" }
             /ip dns cache flush
             :put ("      |-- [OK] Temporary router DNS: " . $tempServers)
-            :log warning ("AdGuard Home: router DNS temporarily set to " . $tempServers . \
-                " during deployment (original: " . $dnsOriginalServers . ")")
+            :log warning ("DNS filter: router DNS temporarily " . $tempServers . \
+                " (original: " . $dnsOriginalServers . ")")
         }
     } else={
-        :put "      |-- [OK] Router DNS does not depend on AdGuard Home"
+        :put "      |-- [OK] Router DNS does not depend on the container"
     }
 
     :local networkOk false
@@ -525,18 +700,13 @@
         :set networkOk true
     } on-error={ }
     :if ($networkOk = false) do={
-        :put ("      |-- [FAILED] Cannot resolve " . $cRegistryHost)
-        :put "      |-- Run: /ip dns print"
-        :put ("      |-- Run: :put [:resolve " . $cRegistryHost . "]")
+        :put ("      |-- [FAILED] Cannot resolve " . $cRegistryHost . "; check /ip dns print")
         :set failReason "Docker Hub is not resolvable"
         :error $failReason
     }
     :put "      |-- [OK] Docker Hub resolves"
 
-    ## ----------------------------------------
-    ## Step 5: Registry configuration
-    ## ----------------------------------------
-
+    ## ---------- Step 5: Registry ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Registry configuration"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Registry configuration...")
@@ -544,100 +714,120 @@
     :if ([/container config get registry-url] != $cRegistryUrl || \
         [/container config get tmpdir] != $cTmpDir) do={
         /container config set registry-url=$cRegistryUrl tmpdir=$cTmpDir
-        :put ("      |-- [OK] Registry: " . $cRegistryUrl)
-        :put ("      |-- [OK] Temp directory: " . $cTmpDir)
+        :put ("      |-- [OK] Registry " . $cRegistryUrl . ", temp " . $cTmpDir)
     } else={
         :put "      |-- [OK] Already configured"
     }
 
-    ## ----------------------------------------
-    ## Step 6: Mount points
-    ## ----------------------------------------
-
+    ## ---------- Step 6: Mounts ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Mount points"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Mount points...")
 
-    :local mountFound false
-    :local mountMatches false
-    :local workMountFound false
-    :local workMountMatches false
-    :foreach mountId in=[/container mounts find where list=$cMountListName] do={
-        :local existingDst [/container mounts get $mountId dst]
-        :local existingSrc [/container mounts get $mountId src]
-        :if ($existingDst = $cMountDst) do={
-            :set mountFound true
-            :if ($existingSrc = $cMountSrc) do={ :set mountMatches true }
+    :local confFound false
+    :local confMatches false
+    :local workFound false
+    :local workMatches false
+    :foreach mountId in=[/container mounts find where list=$appMountList] do={
+        :local dst [/container mounts get $mountId dst]
+        :local src [/container mounts get $mountId src]
+        :if ($dst = $appConfDst) do={
+            :set confFound true
+            :if ($src = $appConfSrc) do={ :set confMatches true }
         }
-        :if ($existingDst = $cWorkMountDst) do={
-            :set workMountFound true
-            :if ($existingSrc = $cWorkMountSrc) do={ :set workMountMatches true }
+        :if ([:len $appWorkDst] > 0 && $dst = $appWorkDst) do={
+            :set workFound true
+            :if ($src = $appWorkSrc) do={ :set workMatches true }
         }
     }
-
-    :if ($mountFound = false) do={
-        /container mounts add list=$cMountListName src=$cMountSrc dst=$cMountDst
-        :put ("      |-- [OK] Created config mount " . $cMountSrc . " -> " . $cMountDst)
+    :if ($confFound = false) do={
+        /container mounts add list=$appMountList src=$appConfSrc dst=$appConfDst
+        :put ("      |-- [OK] Created config mount " . $appConfSrc . " -> " . $appConfDst)
     } else={
-        :if ($mountMatches = false) do={
-            :put "      |-- [FAILED] The config mount uses a different source directory"
-            :put ("      |-- Expected: " . $cMountSrc . " -> " . $cMountDst)
-            :put "      |-- Refusing to switch configuration storage automatically"
-            :put ("      |-- Run: /container mounts print where list=" . $cMountListName)
+        :if ($confMatches = false) do={
+            :put ("      |-- [FAILED] Mount list " . $appMountList . " uses another config source")
+            :put ("      |-- Expected: " . $appConfSrc . " -> " . $appConfDst)
             :set failReason "Config mount mismatch"
             :error $failReason
         }
         :put "      |-- [OK] Config mount verified"
     }
-
-    ## Add the work-data mount on new deployments only, so an existing
-    ## container's work directory is never hidden behind an empty mount.
-    :if ($workMountFound = false) do={
-        :if ($containerExists = false) do={
-            /container mounts add list=$cMountListName src=$cWorkMountSrc dst=$cWorkMountDst
-            :put ("      |-- [OK] Created work-data mount " . $cWorkMountSrc . " -> " . $cWorkMountDst)
+    :if ([:len $appWorkDst] > 0) do={
+        :if ($workFound = false) do={
+            ## Never hide an existing container's work data behind an empty mount.
+            :if ([:len $liveName] > 0) do={
+                :put ("      |-- [FAILED] '" . $liveName . "' has no work-data mount")
+                :put ("      |-- Back up " . $appWorkDst . " and add a mount from " . $appWorkSrc)
+                :set failReason "Work-data mount migration required"
+                :error $failReason
+            }
+            /container mounts add list=$appMountList src=$appWorkSrc dst=$appWorkDst
+            :put ("      |-- [OK] Created work-data mount " . $appWorkSrc . " -> " . $appWorkDst)
         } else={
-            :put "      |-- [FAILED] The existing container has no work-data mount"
-            :put ("      |-- Back up " . $cWorkMountDst . " and add a mount from " . $cWorkMountSrc)
-            :put "      |-- Refusing to repull until runtime data is protected"
-            :set failReason "Work-data mount migration required"
-            :error $failReason
+            :if ($workMatches = false) do={
+                :put ("      |-- [FAILED] Work-data mount must be " . $appWorkSrc . " -> " . $appWorkDst)
+                :set failReason "Work-data mount mismatch"
+                :error $failReason
+            }
+            :put "      |-- [OK] Work-data mount verified"
         }
-    } else={
-        :if ($workMountMatches = false) do={
-            :put "      |-- [FAILED] The work-data mount uses a different source directory"
-            :put ("      |-- Expected: " . $cWorkMountSrc . " -> " . $cWorkMountDst)
-            :set failReason "Work-data mount mismatch"
-            :error $failReason
-        }
-        :put "      |-- [OK] Work-data mount verified"
     }
 
-    ## ----------------------------------------
-    ## Step 7: Environment variables
-    ## ----------------------------------------
-
+    ## ---------- Step 7: Environment ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Environment variables"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Environment variables...")
 
-    :local envId [/container envs find where list=$cEnvListName and key="QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING"]
-    :if ([:len $envId] = 0) do={
-        /container envs add list=$cEnvListName key=QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING value=true
-        :put "      |-- [OK] Added QUIC warning override"
+    :local envChanged false
+    :local envKeys [:toarray ""]
+    :local envValues [:toarray ""]
+    :if ($appId = "adguard") do={
+        :set envKeys ($envKeys, "QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING")
+        :set envValues ($envValues, "true")
     } else={
-        :if ([/container envs get ($envId->0) value] != "true") do={
-            /container envs set ($envId->0) value=true
-            :put "      |-- [OK] Corrected QUIC warning override"
-        } else={
-            :put ("      |-- [OK] Envlist '" . $cEnvListName . "' verified")
+        ## Answer queries from every network, not just the container subnet.
+        :set envKeys ($envKeys, "FTLCONF_dns_listeningMode")
+        :set envValues ($envValues, "ALL")
+        :local tz [:tostr [/system clock get time-zone-name]]
+        :if ([:len $tz] > 0 && $tz != "manual") do={
+            :set envKeys ($envKeys, "TZ")
+            :set envValues ($envValues, $tz)
+        }
+        :if ([:len $cPiholePassword] > 0) do={
+            :set envKeys ($envKeys, "FTLCONF_webserver_api_password")
+            :set envValues ($envValues, $cPiholePassword)
         }
     }
+    :for i from=0 to=([:len $envKeys] - 1) do={
+        :local key ($envKeys->$i)
+        :local value ($envValues->$i)
+        :local ids [/container envs find where list=$appEnvList and key=$key]
+        :if ([:len $ids] = 0) do={
+            /container envs add list=$appEnvList key=$key value=$value
+            :do { /container envs set [find where list=$appEnvList and key=$key] comment="pending" } on-error={ }
+            :set envChanged true
+            :put ("      |-- [OK] Added " . $key)
+        } else={
+            :if ([/container envs get ($ids->0) value] != $value) do={
+                /container envs set ($ids->0) value=$value
+                :do { /container envs set ($ids->0) comment="pending" } on-error={ }
+                :set envChanged true
+                :put ("      |-- [OK] Updated " . $key)
+            }
+        }
+    }
+    ## Changes from a run that failed before applying them are still pending.
+    :do {
+        :if ([:len [/container envs find where list=$appEnvList and comment="pending"]] > 0) do={
+            :set envChanged true
+        }
+    } on-error={ }
+    :if ($envChanged = true) do={
+        :put "      |-- [INFO] Settings changed; the container will be replaced"
+    }
+    :put ("      |-- [OK] Envlist '" . $appEnvList . "' verified")
 
-    ## ----------------------------------------
-    ## Step 8: Veth interface
-    ## ----------------------------------------
-
+    ## ---------- Step 8: Veth ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Network interface"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Network interface...")
@@ -645,223 +835,328 @@
     :local vethIds [/interface veth find name=$cInterface]
     :if ([:len $vethIds] = 0) do={
         /interface veth add name=$cInterface address=$cContainerAddress gateway=$cContainerGateway
-        :put ("      |-- [OK] Created veth '" . $cInterface . "' (" . $cContainerAddress . \
-            " via " . $cContainerGateway . ")")
+        :put ("      |-- [OK] Created veth '" . $cInterface . "' " . $cContainerAddress)
     } else={
-        :local vethId ($vethIds->0)
-        :local currentAddress [:tostr [/interface veth get $vethId address]]
-        :local currentGateway [:tostr [/interface veth get $vethId gateway]]
+        :local currentAddress [:tostr [/interface veth get ($vethIds->0) address]]
+        :local currentGateway [:tostr [/interface veth get ($vethIds->0) gateway]]
         :if ([:len $currentAddress] = 0 && [:len $currentGateway] = 0) do={
-            /interface veth set $vethId address=$cContainerAddress gateway=$cContainerGateway
-            :put ("      |-- [OK] Completed address configuration on '" . $cInterface . "'")
+            /interface veth set ($vethIds->0) address=$cContainerAddress gateway=$cContainerGateway
+            :put ("      |-- [OK] Configured address on '" . $cInterface . "'")
         } else={
-            :put ("      |-- [OK] Veth '" . $cInterface . "' exists")
-            :if ($currentAddress != $cContainerAddress || $currentGateway != $cContainerGateway) do={
-                :put ("      |-- [INFO] Keeping custom settings: " . $currentAddress . \
-                    " via " . $currentGateway)
-            }
+            :put ("      |-- [OK] Veth '" . $cInterface . "' " . $currentAddress . " via " . $currentGateway)
         }
     }
-
     :if ([:len [/interface bridge port find where interface=$cInterface]] = 0) do={
-        :put ("      |-- [WARNING] '" . $cInterface . "' is not attached to a bridge")
-        :put "      |   |-- The container has no network until it is (see README)"
+        :put ("      |-- [WARNING] '" . $cInterface . "' is not attached to a bridge (see README)")
         :set warningCount ($warningCount + 1)
     }
 
-    ## ----------------------------------------
-    ## Step 9: Container deployment
-    ## ----------------------------------------
-
+    ## ---------- Step 9: Deploy ----------
     :set stepNum ($stepNum + 1)
     :set currentStep "Container deployment"
     :put ("[" . $stepNum . "/" . $stepTotal . "] Container deployment...")
-    :put ("      |-- Image: " . $cImage)
+    :put ("      |-- Image: " . $appImage)
 
-    :if ($containerExists = true) do={
-        :put "      |-- Mode: Upgrade (repull)"
-
-        :if ($healthcheckSupported = true) do={
-            :set healthcheckConfigured [$applyHealthcheck command=$healthcheckSetCommand]
+    :local newName $appBase
+    :local newRoot $appRootDir
+    :if ([:len $liveName] > 0) do={
+        :if ($liveName = $appBase) do={ :set newName ($appBase . "-next") }
+        :local oldRoot [:tostr [/container get [find where name=$liveName] root-dir]]
+        :if ([:len $oldRoot] = 0) do={ :set oldRoot $appRootDir }
+        :while ([:len $oldRoot] > 1 && [:pick $oldRoot ([:len $oldRoot] - 1)] = "/") do={
+            :set oldRoot [:pick $oldRoot 0 ([:len $oldRoot] - 1)]
         }
-
-        :local initialState [$getContainerState containerName=$cName]
-        :put ("      |-- Current state: " . $initialState)
-        :if ($initialState = "extracting") do={
-            :put "      |-- [FAILED] The container is already extracting an image"
-            :put "      |-- Wait for it to finish, then run this script again"
-            :set failReason "Container busy"
-            :error $failReason
-        }
-
-        :put "      |-- Triggering repull..."
-        :do {
-            /container repull [find name=$cName] remote-image=$cImage
-        } on-error={
-            :put "      |   |-- [FAILED] RouterOS rejected the repull request"
-            :put "      |   |-- Check free disk space and /container log"
-            :set failReason "Container repull rejected"
-            :error $failReason
-        }
-
-        ## Wait for repull to stop, pull, extract, and restart the container.
-        ## A brief "stopped" between stopping and pulling is not the end: a
-        ## stopped container counts as finished only after extraction was seen,
-        ## or after it stays stopped past the grace period. A running container
-        ## counts only after it was seen going down.
-        :local elapsed 0
-        :local state $initialState
-        :local lastState $initialState
-        :local sawDown ($initialState != "running")
-        :local sawExtracting false
-        :local stoppedSince -1
-        :local repullDone false
-        :local repullAborted false
-        :while ($repullDone = false && $repullAborted = false && $elapsed < $cPullTimeout) do={
-            :delay $pollDelay
-            :set elapsed ($elapsed + $cPollSeconds)
-            :set state [$getContainerState containerName=$cName]
-            :if ($state != "running") do={ :set sawDown true }
-            :if ($state = "extracting") do={ :set sawExtracting true }
-            :if ($state = "stopped") do={
-                :if ($stoppedSince < 0) do={ :set stoppedSince $elapsed }
-            } else={
-                :set stoppedSince -1
-            }
-            :if ($state = "running" && $sawDown = true) do={ :set repullDone true }
-            :if ($state = "stopped" && ($sawExtracting = true || \
-                ($elapsed - $stoppedSince) >= $cRepullGraceSeconds)) do={
-                :set repullDone true
-            }
-            :if ($state = "error" || $state = "missing") do={ :set repullAborted true }
-            :if ($state = "running" && $sawDown = false && $elapsed >= $cRepullGraceSeconds) do={
-                :set repullAborted true
-            }
-            :if ($state != $lastState || ($elapsed % $cProgressSeconds) = 0) do={
-                :put ("      |   |-- " . $elapsed . "s: " . $state)
-                :set lastState $state
-            }
-        }
-
-        :if ($repullAborted = true && $state = "running") do={
-            ## Repull never stopped the container. It may still start later, so
-            ## the DNS fallback must stay in place; this is reported, not fatal.
-            :put ("      |   |-- [WARNING] The container kept running for " . $elapsed . \
-                "s; repull did not visibly start")
-            :put "      |   |-- Check /container print detail; run the script again if needed"
-            :set warningCount ($warningCount + 1)
-            :set dnsKeepFallback true
-            :set repullDone true
-        }
-
-        :if ($repullDone = false) do={
-            :if ($repullAborted = true) do={
-                :put ("      |   |-- [FAILED] Repull ended in state: " . $state)
-            } else={
-                :put ("      |   |-- [FAILED] Repull did not finish within " . $cPullTimeout . "s")
-            }
-            $printContainerDetails containerName=$cName
-            :if ([$getContainerState containerName=$cName] = "stopped") do={
-                :put "      |   |-- Attempting to start the existing container..."
-                :if ([$startContainer containerName=$cName timeout=$cStartTimeout] = true) do={
-                    :put "      |   |-- [RECOVERY] Container started"
-                }
-            }
-            :put "      |   |-- Increase cPullTimeout for slow storage or links"
-            :set failReason ("Repull failed (" . $state . ")")
-            :error $failReason
-        }
-
-        :if ($state = "stopped") do={
-            :put ("      |   |-- Image updated in " . $elapsed . "s; starting container...")
-            :if ([$startContainer containerName=$cName timeout=$cStartTimeout] = false) do={
-                :put "      |   |-- [FAILED] The container did not start"
-                $printContainerDetails containerName=$cName
-                :set failReason "Container did not start after repull"
-                :error $failReason
-            }
-        }
-        :if ($dnsKeepFallback = false) do={
-            :put ("      |   |-- [OK] Repull finished in " . $elapsed . "s")
-        }
-    } else={
-        :put "      |-- Mode: First-time deployment"
-        :put "      |-- Pulling image..."
-        :do {
-            /container add remote-image=$cImage check-certificate=yes name=$cName \
-                interface=$cInterface logging=yes mountlists=$cMountListName start-on-boot=yes \
-                root-dir=$cRootDir workdir="/opt/adguardhome/work" \
-                cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
-                entrypoint=/opt/adguardhome/AdGuardHome \
-                envlist=$cEnvListName
-        } on-error={
-            :put "      |   |-- [FAILED] RouterOS rejected the container request"
-            :put "      |   |-- Check free disk space and /container log"
-            :set failReason "Container creation rejected"
-            :error $failReason
-        }
-
-        ## A new container reaches the stopped state once extraction finishes.
-        :local elapsed 0
-        :local state "other"
-        :local lastState ""
-        :while ($state != "stopped" && $state != "running" && $state != "error" && \
-            $state != "missing" && $elapsed < $cPullTimeout) do={
-            :delay $pollDelay
-            :set elapsed ($elapsed + $cPollSeconds)
-            :set state [$getContainerState containerName=$cName]
-            :if ($state != $lastState || ($elapsed % $cProgressSeconds) = 0) do={
-                :put ("      |   |-- " . $elapsed . "s: " . $state)
-                :set lastState $state
-            }
-        }
-
-        :if ($state != "stopped" && $state != "running") do={
-            :if ($state = "error" || $state = "missing") do={
-                :put ("      |   |-- [FAILED] Image pull ended in state: " . $state)
-            } else={
-                :put ("      |   |-- [FAILED] Extraction did not finish within " . $cPullTimeout . "s")
-            }
-            $printContainerDetails containerName=$cName
-            ## Remove the partial container so the next run starts cleanly.
-            :do {
-                /container remove [find name=$cName]
-                :put "      |   |-- [CLEANUP] Removed the incomplete container"
-            } on-error={
-                :put ("      |   |-- [CLEANUP FAILED] Run: /container remove " . $cName)
-            }
-            :put "      |   |-- Increase cPullTimeout for slow storage or links"
-            :set failReason ("Image pull failed (" . $state . ")")
-            :error $failReason
-        }
-        :put ("      |   |-- [OK] Image extracted in " . $elapsed . "s")
-
-        :if ($healthcheckSupported = true) do={
-            :set healthcheckConfigured [$applyHealthcheck command=$healthcheckSetCommand]
-        }
-
-        :if ($state != "running") do={
-            :put "      |-- Starting container..."
-            :if ([$startContainer containerName=$cName timeout=$cStartTimeout] = false) do={
-                :put "      |   |-- [FAILED] The container did not start"
-                $printContainerDetails containerName=$cName
-                :set failReason "Container did not start"
-                :error $failReason
-            }
-            :put "      |   |-- [OK] Container started"
+        :if ([:len $oldRoot] > 5 && [:pick $oldRoot ([:len $oldRoot] - 5) [:len $oldRoot]] = "-next") do={
+            :set newRoot [:pick $oldRoot 0 ([:len $oldRoot] - 5)]
+        } else={
+            :set newRoot ($oldRoot . "-next")
         }
     }
 
-    ## Stability check: AdGuard Home exits quickly on bad config or mounts.
-    :put ("      |-- Stability check (" . $cStabilitySeconds . "s)...")
-    :delay [:totime ($cStabilitySeconds . "s")]
-    :if ([$getContainerState containerName=$cName] != "running") do={
-        :put "      |   |-- [FAILED] The container stopped after starting"
-        $printContainerDetails containerName=$cName
-        :set failReason "Container is not stable"
+    ## Remove leftovers from an interrupted run: a non-live container with the
+    ## new name, and an unused directory at the new root.
+    :if ([:len [/container find where name=$newName]] > 0 && $newName != $oldName) do={
+        $stopContainer containerName=$newName timeout=$cStopTimeout
+        /container remove [find where name=$newName]
+        :put ("      |-- [CLEANUP] Removed leftover container '" . $newName . "'")
+    }
+    :local newRootFile [$filePath path=$newRoot]
+    ## The new root must not overlap any container root or mount source.
+    :local usedPaths [:toarray ""]
+    :foreach c in=[/container find] do={
+        :set usedPaths ($usedPaths, [$filePath path=[/container get $c root-dir]])
+    }
+    :foreach m in=[/container mounts find] do={
+        :set usedPaths ($usedPaths, [$filePath path=[/container mounts get $m src]])
+    }
+    :local rootInUse false
+    :foreach p in=$usedPaths do={
+        :if ([:len $p] > 0) do={
+            :if ($p = $newRootFile || [:pick $p 0 ([:len $newRootFile] + 1)] = ($newRootFile . "/") || \
+                [:pick $newRootFile 0 ([:len $p] + 1)] = ($p . "/")) do={
+                :set rootInUse true
+            }
+        }
+    }
+    :if ($rootInUse = true) do={
+        :put ("      |-- [FAILED] " . $newRoot . " overlaps a container root or mount")
+        :set failReason "Root directory in use"
         :error $failReason
     }
-    :put "      |   |-- [OK] Container is running"
+    :if ([:len [/file find where name=$newRootFile]] > 0) do={
+        :do {
+            /file remove [find where name=$newRootFile]
+            :put ("      |-- [CLEANUP] Removed unused " . $newRoot)
+        } on-error={
+            :put ("      |-- [WARNING] Could not remove unused " . $newRoot)
+            :set warningCount ($warningCount + 1)
+        }
+    }
+
+    :local bootFlag "no"
+    :if ([:len $oldName] = 0) do={ :set bootFlag "yes" }
+    :if ([:len $oldName] > 0) do={
+        :put ("      |-- Pulling into '" . $newName . "'; '" . $oldName . "' keeps serving DNS")
+    } else={
+        :put ("      |-- Pulling into '" . $newName . "'")
+    }
+    :do {
+        :if ($appId = "adguard") do={
+            /container add remote-image=$appImage check-certificate=yes name=$newName \
+                interface=$cInterface logging=yes mountlists=$appMountList start-on-boot=$bootFlag \
+                root-dir=$newRoot workdir="/opt/adguardhome/work" envlist=$appEnvList \
+                cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
+                entrypoint=/opt/adguardhome/AdGuardHome
+        } else={
+            /container add remote-image=$appImage check-certificate=yes name=$newName \
+                interface=$cInterface logging=yes mountlists=$appMountList start-on-boot=$bootFlag \
+                root-dir=$newRoot envlist=$appEnvList
+        }
+    } on-error={
+        :put "      |   |-- [FAILED] RouterOS rejected the container (disk space? /container log)"
+        :set failReason "Container creation rejected"
+        :error $failReason
+    }
+
+    :local pullState [$waitForExtraction containerName=$newName timeout=$cPullTimeout \
+        poll=$cPollSeconds progress=$cProgressSeconds]
+    :if ($pullState != "stopped" && $pullState != "running") do={
+        :put ("      |   |-- [FAILED] Image pull ended in state: " . $pullState)
+        $printContainerDetails containerName=$newName
+        :do { /container remove [find where name=$newName] } on-error={ }
+        :if ([:len $oldName] > 0) do={
+            :put ("      |   |-- '" . $oldName . "' was not touched and keeps running")
+        }
+        :set failReason ("Image pull failed (" . $pullState . "); increase cPullTimeout if slow")
+        :error $failReason
+    }
+    :put "      |   |-- [OK] Image extracted"
+
+    ## Same app: skip the switch when the new image matches the running one.
+    :local upToDate false
+    :if ([:len $liveName] > 0 && $switchingApps = false && $envChanged = false) do={
+        :local oldRootFile [$filePath path=[/container get [find where name=$liveName] root-dir]]
+        :local oldProbe [$fileInfo path=($oldRootFile . "/" . $appProbe)]
+        :local newProbe [$fileInfo path=($newRootFile . "/" . $appProbe)]
+        :set upToDate ([:len $oldProbe] > 0 && $oldProbe = $newProbe)
+        :if ($upToDate = true && [:len $appTagProbe] > 0) do={
+            :local oldTag [$fileInfo path=($oldRootFile . "/" . $appTagProbe) mode="contents"]
+            :local newTag [$fileInfo path=($newRootFile . "/" . $appTagProbe) mode="contents"]
+            :set upToDate ([:len $oldTag] > 0 && $oldTag = $newTag)
+        }
+        :if ($upToDate = true && [$getContainerState containerName=$liveName] != "running") do={
+            ## A stopped live container is replaced even if the image is the same.
+            :set upToDate false
+        }
+    }
+
+    :if ($upToDate = true) do={
+        /container remove [find where name=$newName]
+        :put ("      |-- [OK] Already up to date; '" . $liveName . "' was not restarted")
+        :set resultText "UP TO DATE"
+    } else={
+        :if ($healthcheckSupported = true) do={
+            :set healthcheckConfigured [$applyHealthcheck command=("/container set [find name=\"" . \
+                $newName . "\"] healthcheck-cmd=\"" . $appHealthcheckCmd . "\" healthcheck-interval=" . \
+                $cHealthcheckInterval . " healthcheck-timeout=" . $cHealthcheckTimeout . \
+                " healthcheck-start-period=" . $cHealthcheckStartPeriod . " healthcheck-retries=" . \
+                $cHealthcheckRetries)]
+        }
+
+        ## The new container must answer DNS if the old one did (Pi-hole
+        ## always must). The probe is retried so a brief upstream hiccup does
+        ## not lower the bar. A fresh Pi-hole may build its blocklists first.
+        :local oldAnswered false
+        :local requireDns false
+        :local dnsWait $cDnsReadyTimeout
+        :local configBackup ""
+        :local confFile ([$filePath path=$appConfSrc] . "/" . $appConfigFile)
+        :local hasConfig ([:len [/file find where name=$confFile]] > 0)
+        :if ([:len $oldName] > 0) do={
+            :if ([$getContainerState containerName=$oldName] = "running") do={
+                :set oldAnswered [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=15]
+            }
+            :set requireDns $oldAnswered
+            :if ($appId = "pihole") do={ :set requireDns true }
+            :if ($appId = "pihole" && $hasConfig = false) do={ :set dnsWait ($cDnsReadyTimeout * 3) }
+            ## A fresh AdGuard Home answers DNS only after its setup wizard, so
+            ## replacing a working resolver with it needs explicit consent.
+            :if ($appId = "adguard" && $hasConfig = false && $oldAnswered = true) do={
+                :if ($forceSwitch = false) do={
+                    :put "      |-- [STOPPED] AdGuard Home has no config yet and would not answer DNS"
+                    :put ("      |   |   until its setup wizard is done. '" . $oldName . "' keeps running.")
+                    :put "      |-- To switch anyway: :global DnsFilterForce \"yes\" and run again"
+                    :do { /container remove [find where name=$newName] } on-error={ }
+                    :set failReason "Switch needs AdGuard Home setup (or DnsFilterForce)"
+                    :error $failReason
+                }
+                :set requireDns false
+                :put "      |-- [INFO] Forced: DNS is down until the AdGuard Home setup wizard is done"
+            }
+            :if ($switchingApps = false) do={
+                ## Upgrades may migrate the config to a format the old version
+                ## cannot read, so keep a copy for rollback.
+                :local ok false
+                :do { :set ok [$copySmallFile src=$confFile dst=($confFile . ".rollback")] } on-error={ }
+                :if ($ok = true) do={
+                    :set configBackup ($confFile . ".rollback")
+                    :put ("      |-- [OK] Config backed up to " . $configBackup)
+                } else={
+                    :put "      |-- [INFO] Config backup unavailable; rollback reuses the current file"
+                }
+            }
+            :put ("      |-- Switching '" . $oldName . "' -> '" . $newName . "'...")
+            :if ([$stopContainer containerName=$oldName timeout=$cStopTimeout] = false) do={
+                :put ("      |   |-- [FAILED] '" . $oldName . "' did not stop in time; switch cancelled")
+                :if ([$startContainer containerName=$oldName timeout=$cStartTimeout] = true) do={
+                    :put ("      |   |-- [OK] '" . $oldName . "' is running")
+                } else={
+                    :put ("      |   |-- [CRITICAL] '" . $oldName . "' is not running; check /container print")
+                }
+                :do { /container remove [find where name=$newName] } on-error={ }
+                :set failReason "Old container did not stop"
+                :error $failReason
+            }
+        }
+
+        ## Start and verify the new container; any failure rolls back below.
+        :local switchOk false
+        :do {
+            :if ([$startContainer containerName=$newName timeout=$cStartTimeout] = false) do={
+                :set failReason "New container did not start"
+                :error $failReason
+            }
+            :put ("      |   |-- [OK] Started; checking stability (" . $cStabilitySeconds . "s)...")
+            :delay [:totime ($cStabilitySeconds . "s")]
+            :if ([$getContainerState containerName=$newName] != "running") do={
+                :set failReason "New container stopped after starting"
+                :error $failReason
+            }
+            :if ($requireDns = true) do={
+                :put "      |   |-- Waiting for DNS answers..."
+                :if ([$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=$dnsWait] = false) do={
+                    :set failReason "New container does not answer DNS"
+                    :error $failReason
+                }
+                :put ("      |   |-- [OK] Answers DNS at " . $containerIp)
+            }
+            :set switchOk true
+        } on-error={ }
+
+        :if ($switchOk = false) do={
+            :put ("      |   |-- [FAILED] " . $failReason)
+            $printContainerDetails containerName=$newName
+            :if ([:len $oldName] = 0) do={ :error $failReason }
+
+            ## Rollback: stop the new container and bring the old one back.
+            :put ("      |-- Rolling back to '" . $oldName . "'...")
+            :if ([$stopContainer containerName=$newName timeout=$cStopTimeout] = false) do={
+                :put ("      |   |-- [WARNING] '" . $newName . "' did not confirm it stopped")
+            }
+            ## The new version may have migrated the config; restore it first.
+            :if ([:len $configBackup] > 0) do={
+                :local copied false
+                :do { :set copied [$copySmallFile src=$configBackup dst=$confFile] } on-error={ }
+                :if ($copied = true) do={
+                    :put "      |   |-- [OK] Config restored from backup"
+                } else={
+                    :put "      |   |-- [WARNING] Could not restore the config backup"
+                    :set warningCount ($warningCount + 1)
+                }
+            }
+            ## The rollback passes only the checks the old container passed before.
+            :local restored [$startContainer containerName=$oldName timeout=$cStartTimeout]
+            :if ($restored = true) do={
+                :delay [:totime ($cStabilitySeconds . "s")]
+                :set restored ([$getContainerState containerName=$oldName] = "running")
+            }
+            :if ($restored = true && $oldAnswered = true) do={
+                :set restored [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=$cDnsReadyTimeout]
+            }
+            :if ($restored = true) do={
+                :do { /container remove [find where name=$newName] } on-error={ }
+                :put ("      |   |-- [OK] Rolled back; '" . $oldName . "' is running again")
+                :set resultText "ROLLED BACK"
+                :set failReason ($failReason . "; previous version restored")
+            } else={
+                :put ("      |   |-- [CRITICAL] '" . $oldName . "' did not pass its checks either")
+                :put ("      |   |-- Both containers were kept: '" . $oldName . "', '" . $newName . "'")
+                :set failReason ($failReason . "; rollback failed")
+            }
+            :error $failReason
+        }
+
+        ## Success: make the new container permanent.
+        :set servingName $newName
+        :do { /container set [find where name=$newName] start-on-boot=yes } on-error={ }
+        :if ([:len $oldName] > 0) do={
+            :if ($switchingApps = true) do={
+                ## Keep the previous app's container stopped for manual fallback.
+                :do { /container set [find where name=$oldName] start-on-boot=no } on-error={ }
+                :put ("      |-- [OK] '" . $oldName . "' kept stopped; remove it with:")
+                :put ("      |   |-- /container remove [find name=" . $oldName . "]")
+                :if ([:len $staleName] > 0) do={
+                    :do {
+                        /container remove [find where name=$staleName]
+                        :put ("      |-- [OK] Removed the earlier stopped '" . $staleName . "'")
+                    } on-error={ }
+                }
+                :set resultText ("SWITCHED TO " . $appTitle)
+            } else={
+                :do {
+                    /container remove [find where name=$oldName]
+                    :put ("      |-- [OK] Removed previous container '" . $oldName . "'")
+                } on-error={
+                    :put ("      |-- [WARNING] Could not remove '" . $oldName . "'")
+                    :set warningCount ($warningCount + 1)
+                }
+                :set resultText "UPGRADED"
+            }
+            :if ([:len $configBackup] > 0) do={
+                :do { /file remove [find where name=$configBackup] } on-error={ }
+            }
+        } else={
+            :set resultText "INSTALLED"
+        }
+        ## Only one app may serve the shared address: stop the other app's
+        ## container and keep it from starting on boot.
+        :if ([:len $otherLive] > 0 && $otherLive != $oldName && \
+            [$appScore containerName=$otherLive] > 0) do={
+            $stopContainer containerName=$otherLive timeout=$cStopTimeout
+            :do { /container set [find where name=$otherLive] start-on-boot=no } on-error={ }
+            :put ("      |-- [OK] '" . $otherLive . "' stopped and disabled on boot")
+        }
+        :do {
+            /container envs set [find where list=$appEnvList and comment="pending"] comment=""
+        } on-error={ }
+        ## Keep the familiar name when it is free.
+        :if ($newName != $appBase && [:len [/container find where name=$appBase]] = 0) do={
+            :do {
+                /container set [find where name=$newName] name=$appBase
+                :set servingName $appBase
+            } on-error={ }
+        }
+    }
 
 } on-error={
     :set deploymentSuccess false
@@ -873,126 +1168,94 @@
 ## ========================================
 ## Restore router DNS
 ## ========================================
-## Runs on success and failure. The original settings are restored only once
-## AdGuard Home answers queries; otherwise the fallback stays so the router
-## keeps working DNS.
+## Restores the original settings once the serving container answers;
+## otherwise the fallback stays so the router keeps working DNS.
 
 :if ($dnsFallbackActive = true) do={
     :put "[DNS] Restoring router DNS..."
-    :local adguardAnswers false
-    :local waited 0
-    :if ($dnsKeepFallback = false && [$getContainerState containerName=$cName] = "running") do={
-        :while ($adguardAnswers = false && $waited <= $cDnsReadyTimeout) do={
-            :do {
-                :resolve $cDnsTestHost server=$containerIp
-                :set adguardAnswers true
-            } on-error={
-                :delay $pollDelay
-                :set waited ($waited + $cPollSeconds)
-            }
+    :local answers false
+    :if ([:len $servingName] > 0 && [$getContainerState containerName=$servingName] = "running") do={
+        :set answers [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=$cDnsReadyTimeout]
+    }
+    :local restoredOk false
+    :if ($answers = true) do={
+        :do {
+            /ip dns set servers=$dnsOriginalServers
+            :if ($dnsDohUsesContainer = true) do={ /ip dns set use-doh-server=$dnsOriginalDoh }
+            /ip dns cache flush
+            :do { /system script remove [find where name=$cRestoreScript] } on-error={ }
+            :set restoredOk true
+        } on-error={
+            :put "      |-- [WARNING] RouterOS rejected the original DNS settings"
         }
     }
-
-    :if ($adguardAnswers = true) do={
-        /ip dns set servers=$dnsOriginalServers
-        :if ($dnsDohUsesContainer = true) do={
-            /ip dns set use-doh-server=$dnsOriginalDoh
-        }
-        /ip dns cache flush
-        :set AGHDnsRestorePending "no"
+    :if ($restoredOk = true) do={
         :set dnsStatus ("restored (" . $dnsOriginalServers . ")")
-        :put ("      |-- [OK] AdGuard Home answers DNS at " . $containerIp)
-        :put ("      |-- [OK] Router DNS restored: " . $dnsOriginalServers)
-        :put "      |-- [OK] DNS cache flushed"
-        :log info "AdGuard Home: router DNS restored"
+        :put ("      |-- [OK] Restored " . $dnsOriginalServers . " and flushed the cache")
+        :log info "DNS filter: router DNS restored"
     } else={
-        :if ($dnsKeepFallback = true) do={
-            :put "      |-- [WARNING] The upgrade did not complete a restart"
-        } else={
-            :put ("      |-- [WARNING] AdGuard Home is not answering DNS at " . $containerIp)
-        }
-        :put "      |-- Keeping the fallback DNS so the router stays online"
-        :put "      |-- After AdGuard Home answers again, run this script again, or:"
-        :put ("      |   |-- /ip dns set servers=\"" . $dnsOriginalServers . "\"")
-        :if ($dnsDohUsesContainer = true) do={
-            :put ("      |   |-- /ip dns set use-doh-server=\"" . $dnsOriginalDoh . "\"")
-        }
-        :put "      |   |-- /ip dns cache flush"
-        :put "      |   |-- /system script environment remove [find name~\"^AGHDnsRestore\"]"
+        :put ("      |-- [WARNING] Keeping the fallback; " . $containerIp . " is not answering DNS")
+        :put ("      |-- Original servers: " . $dnsOriginalServers)
+        :put "      |-- Run this script again once it answers, or restore manually with:"
+        :put ("      |   |-- /system script run " . $cRestoreScript)
         :set warningCount ($warningCount + 1)
-        :log warning ("AdGuard Home: fallback DNS kept; original servers: " . $dnsOriginalServers)
+        :log warning ("DNS filter: fallback DNS kept; original servers: " . $dnsOriginalServers)
     }
 }
+
+:set DnsFilterLock ""
 
 ## ========================================
 ## Summary
 ## ========================================
 
-:local finalState [$getContainerState containerName=$cName]
-:local healthcheckSummary "unavailable (needs RouterOS 7.23+)"
+:if ($deploymentSuccess = false && $resultText != "ROLLED BACK") do={ :set resultText "FAILED" }
+:local finalState "none"
+:if ([:len $servingName] > 0) do={ :set finalState [$getContainerState containerName=$servingName] }
+:local healthcheckSummary "needs RouterOS 7.23+"
 :if ($healthcheckSupported = true) do={
-    :if ($healthcheckConfigured = true) do={
-        :set healthcheckSummary ("configured (start period " . $cHealthcheckStartPeriod . ")")
-    } else={
-        :set healthcheckSummary "not configured"
-    }
+    :set healthcheckSummary "unchanged"
+    :if ($healthcheckConfigured = true) do={ :set healthcheckSummary "configured" }
 }
-:if ([:len $containerIp] = 0) do={
-    :set containerIp $cContainerAddress
-}
+:if ([:len $containerIp] = 0) do={ :set containerIp $cContainerAddress }
+:if ([:len $appTitle] = 0) do={ :set appTitle "AdGuard Home / Pi-hole" }
 
 :put ""
 :put "========================================"
-:if ($deploymentSuccess = true) do={
-    :if ($warningCount = 0) do={
-        :put "  DEPLOYMENT SUCCESSFUL"
-    } else={
-        :put ("  DEPLOYMENT SUCCESSFUL WITH " . $warningCount . " WARNING(S)")
-    }
+:if ($warningCount > 0 && $deploymentSuccess = true) do={
+    :put ("  " . $resultText . " (" . $warningCount . " warning(s))")
 } else={
-    :put "  DEPLOYMENT FAILED"
+    :put ("  " . $resultText)
 }
 :put "========================================"
-:if ($deploymentSuccess = false) do={
-    :put ("  Reason:      " . $failReason)
-}
-:if ($containerExists = true) do={
-    :put "  Mode:        Upgrade"
-} else={
-    :put "  Mode:        First-time deployment"
-}
-:put ("  Container:   " . $cName . " (" . $finalState . ")")
-:put ("  Image:       " . $cImage)
+:if ($deploymentSuccess = false) do={ :put ("  Reason:      " . $failReason) }
+:put ("  App:         " . $appTitle)
+:put ("  Container:   " . $servingName . " (" . $finalState . ")")
 :put ("  Address:     " . $containerIp)
 :put ("  Router DNS:  " . $dnsStatus)
 :put ("  Healthcheck: " . $healthcheckSummary)
-
 :if ($deploymentSuccess = true) do={
-    :if ($containerExists = false) do={
-        :put ""
-        :put "  Next steps:"
-        :put ("  1. Attach '" . $cInterface . "' to a bridge with " . $cContainerGateway . " (see README)")
-        :put ("  2. Open http://" . $containerIp . ":3000 and complete the setup wizard")
-        :put "  3. Point clients or DHCP at AdGuard Home"
+    :if ($appId = "pihole") do={
+        :put ("  Web UI:      http://" . $containerIp . "/admin")
+        :if ($resultText != "UP TO DATE" && [:len $cPiholePassword] = 0) do={
+            :put ("  Password:    first install: see /container log " . $servingName)
+        }
     } else={
-        :put ("  Web UI:      http://" . $containerIp)
+        :if ($resultText = "INSTALLED" || $resultText = "SWITCHED TO AdGuard Home") do={
+            :put ("  Web UI:      http://" . $containerIp . ":3000 (setup wizard on first run)")
+        } else={
+            :put ("  Web UI:      http://" . $containerIp)
+        }
     }
-    :if ($healthcheckConfigured = true) do={
-        :put "  Status:      /container print proplist=name,healthcheck-status"
-    }
-    :log info ("AdGuard Home: deployment completed (" . $finalState . ")")
+    :log info ("DNS filter: " . $resultText . " " . $appTitle)
 } else={
-    :put ""
-    :put "  Troubleshooting:"
-    :put "    /container print detail"
-    :put ("    /container log " . $cName)
-    :put "    /disk print"
-    :put "    /ip dns print"
-    :log error ("AdGuard Home: deployment failed: " . $failReason)
+    :put "  Check:       /container print detail; /ip dns print"
+    :log error ("DNS filter: " . $resultText . ": " . $failReason)
 }
 :put "========================================"
 :put ""
 
 :if ($deploymentSuccess = false) do={
-    :error ("AdGuard Home deployment failed: " . $failReason)
+    :error ($resultText . ": " . $failReason)
 }
+#SCRIPT-COMPLETE

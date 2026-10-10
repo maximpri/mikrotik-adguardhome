@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Static checks for adguardhome_script.rsc (no RouterOS needed).
+
+- The one-line installer loads the script with /tool fetch output=user,
+  which silently truncates at 64512 bytes; keep a safety margin.
+- The completeness marker must appear exactly once, as the last line.
+- Brackets, braces, parentheses, and strings must balance.
+- Every $variable must be declared (or be a known function argument).
+"""
+import re
+import sys
+
+PATH = sys.argv[1] if len(sys.argv) > 1 else "adguardhome_script.rsc"
+MAX_BYTES = 60000
+MARKER = "#SCRIPT-COMPLETE"
+# Function arguments and loop variables used inside helper functions.
+ARGS = {
+    "containerName", "timeout", "poll", "progress", "command", "value", "path",
+    "mode", "src", "dst", "base", "host", "server", "k", "v", "s", "f", "d", "i",
+    "n", "c", "m", "p", "sep", "mountId",
+}
+
+text = open(PATH, encoding="utf-8").read()
+errors = []
+
+size = len(text.encode("utf-8"))
+if size > MAX_BYTES:
+    errors.append(f"size {size} bytes exceeds {MAX_BYTES}")
+if text.count(MARKER) != 1 or text.rstrip().splitlines()[-1] != MARKER:
+    errors.append(f"{MARKER} must appear exactly once, as the last line")
+
+code, in_string = [], False
+for number, line in enumerate(text.splitlines(), 1):
+    if line.lstrip().startswith("#") and not in_string:
+        continue
+    j = 0
+    while j < len(line):
+        ch = line[j]
+        if ch == "\\" and in_string:
+            j += 2
+            continue
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            code.append(ch)
+        j += 1
+    if in_string and not line.rstrip().endswith("\\"):
+        errors.append(f"line {number}: unterminated string")
+        in_string = False
+joined = "".join(code)
+for pair in ("{}", "[]", "()"):
+    if joined.count(pair[0]) != joined.count(pair[1]):
+        errors.append(f"unbalanced {pair}: {joined.count(pair[0])} vs {joined.count(pair[1])}")
+
+used = set(re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)", text))
+declared = set(re.findall(r":(?:local|global) ([A-Za-z_][A-Za-z0-9_]*)", text))
+undeclared = sorted(used - declared - ARGS)
+if undeclared:
+    errors.append("undeclared variables: " + ", ".join(undeclared))
+
+if errors:
+    print("\n".join(errors))
+    sys.exit(1)
+print(f"OK: {size} bytes")
