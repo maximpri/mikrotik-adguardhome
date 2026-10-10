@@ -1,18 +1,19 @@
 # ============================================================================
 # mikrotik-adguardhome loader: AdGuard Home / Pi-hole for MikroTik RouterOS
 # ============================================================================
-# Version: 2.1.0
+# Version: 2.2.0
 # Install and run (RouterOS terminal):
 #   :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
 # Afterwards:
 #   /system script run mikrotik-adguardhome
 #
 # Each run, the loader:
-#   1. Rewrites /system script mikrotik-adguardhome as a short stub that runs
-#      the latest loader, so an old or broken copy never matters.
-#   2. Reads settings from /system script mikrotik-adguardhome-settings,
+#   1. Reads settings from /system script mikrotik-adguardhome-settings,
 #      creating it on first use (and carrying over settings from earlier
 #      versions of the loader).
+#   2. Rewrites /system script mikrotik-adguardhome as a short stub that runs
+#      the latest loader, so an old or broken copy never matters. The stub
+#      switches to the fallback DNS if the router cannot resolve names.
 #   3. Downloads adguardhome_script.rsc, pinned to one commit when GitHub
 #      can resolve it, to a temporary file and imports it with those
 #      settings. The script is one { } block, so a truncated download fails
@@ -67,34 +68,19 @@
 }
 
 :put ""
-:put "mikrotik-adguardhome loader v2.1.0"
+:put "mikrotik-adguardhome loader v2.2.0"
 
 ## Clear state left by earlier loader versions.
 :do {
     /system script environment remove [find where name~"^(DnsFilter|AGHDnsRestore|AghDelegated|AghSettings)"]
 } on-error={ }
 
-## 1. Stub: always run the latest loader. Keep the comment, which records
-##    the deployed image for the up-to-date check.
-:local stub (":local s [:parse ([/tool fetch url=\"https://raw.githubusercontent.com/" . $repo . "/" . \
-    $ref . "/" . $name . ".rsc\" output=user as-value]->\"data\")]; \$s")
+## 1. Capture any existing copy of the loader script; an earlier version kept
+##    the settings in its own source.
 :local scriptIds [/system script find where name=$name]
 :local oldSource ""
 :if ([:len $scriptIds] > 0) do={
     :set oldSource [:tostr [/system script get ($scriptIds->0) source]]
-    :if ($oldSource != $stub) do={
-        /system script set ($scriptIds->0) source=$stub
-        :put "  [OK] Updated /system script mikrotik-adguardhome"
-    }
-    ## A hand-made script may lack the permissions later runs need.
-    :do {
-        /system script set ($scriptIds->0) policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon
-    } on-error={
-        :put "  [WARNING] Could not set full permissions on /system script mikrotik-adguardhome"
-    }
-} else={
-    /system script add name=$name source=$stub
-    :put "  [OK] Installed /system script mikrotik-adguardhome"
 }
 
 ## 2. Settings: create the settings script on first use, carrying over values
@@ -129,7 +115,76 @@
 }
 :do { /system script environment remove [find where name="AghSettings"] } on-error={ }
 
-## 3. Pin the download to one commit, so no stale cached copy is used. Plain
+## 3. Stub: runs the latest loader. If the router cannot resolve names (its
+##    DNS server is the container and the container is down, as on a RAM
+##    disk after a reboot), it switches to the fallback DNS first and saves
+##    the original settings where the deployment script restores them.
+##    The comment, which records the deployed image, is kept.
+:local fb ""
+:local item ""
+:local raw [:tostr ($settings->"fallbackDns")]
+:for i from=0 to=[:len $raw] do={
+    :local ch ""
+    :if ($i < [:len $raw]) do={ :set ch [:pick $raw $i] }
+    :if ($i = [:len $raw] || $ch = "," || $ch = ";") do={
+        :if ([:len $item] > 0) do={
+            :if ([:len $fb] > 0) do={ :set fb ($fb . ",") }
+            :set fb ($fb . $item)
+        }
+        :set item ""
+    } else={
+        :if ($ch != " ") do={ :set item ($item . $ch) }
+    }
+}
+:local loaderUrl ("https://raw.githubusercontent.com/" . $repo . "/" . $ref . "/" . $name . ".rsc")
+:local stub ( \
+    "# mikrotik-adguardhome: runs the latest loader. The loader rewrites this\r\n" . \
+    "# script on every run; change settings in mikrotik-adguardhome-settings.\r\n" . \
+    ":if ([:len \"" . $fb . "\"] > 0) do={\r\n" . \
+    "    :do { :resolve raw.githubusercontent.com } on-error={\r\n" . \
+    "        ## The router cannot resolve, for example because its DNS server is\r\n" . \
+    "        ## the container and the container is down. Save the DNS settings\r\n" . \
+    "        ## for the deployment script to restore, then use the fallback.\r\n" . \
+    "        :local r \"mikrotik-adguardhome-restore\"\r\n" . \
+    "        :if ([:len [/system script find where name=\$r]] = 0) do={\r\n" . \
+    "            :local o \"\"\r\n" . \
+    "            :foreach x in=[/ip dns get servers] do={\r\n" . \
+    "                :if ([:len \$o] > 0) do={ :set o (\$o . \",\") }\r\n" . \
+    "                :set o (\$o . [:tostr \$x])\r\n" . \
+    "            }\r\n" . \
+    "            :local d [:tostr [/ip dns get use-doh-server]]\r\n" . \
+    "            :local u \"no\"\r\n" . \
+    "            :local c (\"/ip dns set servers=\\\"\" . \$o . \"\\\"\")\r\n" . \
+    "            :if ([:len \$d] > 0) do={\r\n" . \
+    "                :set u \"yes\"\r\n" . \
+    "                :set c (\$c . \"; /ip dns set use-doh-server=\\\"\" . \$d . \"\\\"\")\r\n" . \
+    "            }\r\n" . \
+    "            /system script add name=\$r comment=(\$o . \"|\" . \$u . \"|" . $fb . "|\" . \$d) source=(\$c . \\\r\n" . \
+    "                \"; /ip dns cache flush; /system script remove [find name=\\\"\" . \$r . \"\\\"]\")\r\n" . \
+    "        }\r\n" . \
+    "        /ip dns set servers=\"" . $fb . "\" use-doh-server=\"\"\r\n" . \
+    "        /ip dns cache flush\r\n" . \
+    "        :put \"mikrotik-adguardhome: router DNS is not answering; using " . $fb . " to download\"\r\n" . \
+    "    }\r\n" . \
+    "}\r\n" . \
+    ":local s [:parse ([/tool fetch url=\"" . $loaderUrl . "\" output=user as-value]->\"data\")]; \$s\r\n")
+:if ([:len $scriptIds] > 0) do={
+    :if ($oldSource != $stub) do={
+        /system script set ($scriptIds->0) source=$stub
+        :put "  [OK] Updated /system script mikrotik-adguardhome"
+    }
+    ## A hand-made script may lack the permissions later runs need.
+    :do {
+        /system script set ($scriptIds->0) policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon
+    } on-error={
+        :put "  [WARNING] Could not set full permissions on /system script mikrotik-adguardhome"
+    }
+} else={
+    /system script add name=$name source=$stub
+    :put "  [OK] Installed /system script mikrotik-adguardhome"
+}
+
+## 4. Pin the download to one commit, so no stale cached copy is used. Plain
 ##    request: RouterOS fetch may reject custom headers or partial responses.
 :local commit $ref
 :do {

@@ -28,8 +28,8 @@ See [Installing the bootstrap script](#installing-the-bootstrap-script) for othe
 
 **The loader.** `mikrotik-adguardhome.rsc` is the bootstrap script. It runs on every update, so it handles whatever earlier versions left on the router:
 
-1. It rewrites `/system script mikrotik-adguardhome` as a two-line stub that downloads and runs the latest loader. An old, broken, or hand-made copy is replaced. The stub's comment, which records the deployed image, is kept.
-2. It reads your settings from `/system script mikrotik-adguardhome-settings`. On first use it creates that script, carrying over values from an earlier loader that kept settings in its own source.
+1. It reads your settings from `/system script mikrotik-adguardhome-settings`. On first use it creates that script, carrying over values from an earlier loader that kept settings in its own source.
+2. It rewrites `/system script mikrotik-adguardhome` as a short stub that downloads and runs the latest loader. An old, broken, or hand-made copy is replaced. The stub's comment, which records the deployed image, is kept. If the router can't resolve names when the stub runs, for example because its DNS server is the container and the container is down, the stub switches to `fallbackDns` before downloading. It saves the original DNS settings where the deployment script restores them.
 3. It downloads the version tagged `latest`. When GitHub reports which commit the tag points to, it pins the download to that commit. Otherwise it prints `Using 'latest'` and downloads through GitHub's cache, which can serve the previous version for up to about 5 minutes after a new one is published.
 4. It downloads `adguardhome_script.rsc` to a temporary file, which has no size limit, imports it with your settings, and deletes the file. The deployment script is a single block, so a truncated download fails to parse and nothing runs.
 
@@ -50,7 +50,7 @@ The bootstrap (loader) script is the only part that lives on the router permanen
 
 | Script | Contents | Updated by runs |
 |---|---|---|
-| `mikrotik-adguardhome` | A two-line stub that downloads and runs the latest loader. Its comment records the deployed image. | Rewritten on every run |
+| `mikrotik-adguardhome` | A short stub that downloads and runs the latest loader, using the fallback DNS if the router can't resolve. Its comment records the deployed image. | Rewritten on every run |
 | `mikrotik-adguardhome-settings` | Your settings (see [Configuration](#configuration)) | Never |
 
 Installing it also runs a deployment right away, so the first run installs or upgrades the app. Use any one of these methods.
@@ -63,7 +63,7 @@ Installing it also runs a deployment right away, so the first run installs or up
 :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
 ```
 
-Then click **Run Script**. This line is already the stub. The first run gives the script full permissions and creates the settings script.
+Then click **Run Script**. The first run replaces this line with the full stub, gives the script full permissions, and creates the settings script.
 
 **File import.** Download the loader and import it:
 
@@ -110,7 +110,8 @@ Every run ends with a summary of the result, container, address, router DNS stat
 **Self-healing.** Each run repairs what an interrupted or failed run, or an earlier version, left behind:
 
 - a leftover `<name>-next` container, or an unused root directory;
-- router DNS settings saved in `mikrotik-adguardhome-restore` while a fallback was active;
+- router DNS settings saved in `mikrotik-adguardhome-restore` while a fallback was active, including when the router could not resolve at all (they are restored right away if they never pointed at the container);
+- a container whose files are gone, such as on a RAM disk after a reboot: it is replaced with a fresh pull;
 - a work-data mount that was added but never used;
 - a run lock older than 20 minutes;
 - scripts and global variables from earlier versions (such as `dns-filter` and `dns-filter-restore`).
@@ -197,6 +198,40 @@ The image tag `latest` changes with every upstream release. Set a fixed image ta
   ```
 
   A freshly installed AdGuard Home answers DNS only after its setup wizard. If the current app is answering DNS, the script won't replace it with an unconfigured AdGuard Home; the current app keeps running. To switch anyway, accepting a DNS outage until the wizard is done, run `:global AghForce "yes"` before the loader. Switching back to an app whose container was kept stopped reuses its configuration and is verified like any upgrade.
+
+## Running on a RAM disk
+
+Routers without USB storage but with plenty of RAM can keep the container in a RAM disk, with only the small config on internal flash. Work data (statistics, query log, filter cache) lives in RAM, so it resets on every reboot. This setup is untested; please report results in [issue #11](https://github.com/maximpri/mikrotik-adguardhome/issues/11).
+
+1. Create a RAM disk. 512 MB is plenty for either app plus a second copy during upgrades:
+
+   ```routeros
+   /disk add type=tmpfs tmpfs-max-size=512M slot=ramdisk1
+   ```
+
+   If the RAM disk is missing after a reboot, add this command to the startup scheduler below, before the run.
+
+2. Install the bootstrap script (see [Quick start](#quick-start)). With nothing at `/usb1`, the first run stops at the storage check without changing anything.
+
+3. Edit `mikrotik-adguardhome-settings`: set `storage` to `/ramdisk1`, and `configStorage` to a directory on internal flash, such as `/agh-conf`. On devices whose `/file` list shows a `flash` folder, use `/flash/agh-conf`. The config file is a few kilobytes and rarely written.
+
+4. Run `/system script run mikrotik-adguardhome` again to install.
+
+5. Rebuild the container after every reboot, once the internet connection is up:
+
+   ```routeros
+   /system scheduler add name=mikrotik-adguardhome-boot start-time=startup on-event=":delay 60s; /system script run mikrotik-adguardhome"
+   ```
+
+   For PPPoE, you can run the same command from the PPP profile's `on-up` script instead.
+
+After a reboot, the container's files are gone and the router's DNS server (the container) doesn't answer:
+
+1. The stub switches router DNS to `fallbackDns` and saves the original setting.
+2. The deployment script pulls a fresh image into the RAM disk and replaces the broken container.
+3. Once the new container answers DNS, the original router DNS setting is restored.
+
+Clients that query the container directly have no DNS until then. Give them a secondary DNS server through DHCP if that matters.
 
 ## Scheduled updates (optional)
 
