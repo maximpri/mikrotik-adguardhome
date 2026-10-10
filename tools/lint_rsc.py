@@ -22,7 +22,7 @@ MARKER = "#SCRIPT-COMPLETE"
 ARGS = {
     "containerName", "timeout", "poll", "progress", "command", "value", "path",
     "mode", "src", "dst", "base", "image", "source", "key", "host", "server", "k", "v", "s", "f", "d", "i",
-    "n", "c", "m", "p", "id", "sep", "mountId",
+    "n", "c", "m", "p", "id", "x", "sep", "mountId",
 }
 
 text = open(PATH, encoding="utf-8").read()

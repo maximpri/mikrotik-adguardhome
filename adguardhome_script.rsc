@@ -1,7 +1,7 @@
 # ============================================================================
 # AdGuard Home / Pi-hole Container Deployment Script for MikroTik RouterOS
 # ============================================================================
-# Version: 2.1.0
+# Version: 2.2.0
 # Author:  Maxim Priezjev
 # Date:    October 10, 2026
 # Minimum RouterOS: 7.22
@@ -106,7 +106,7 @@
 ## Internal state
 ## ========================================
 
-:local cScriptVersion "2.1.0"
+:local cScriptVersion "2.2.0"
 :local stepNum 0
 :local stepTotal 10
 :local currentStep ""
@@ -263,18 +263,20 @@
     :return 0
 }
 
-## Stops a container and waits until it is stopped (or gone).
+## Stops a container and waits until it no longer runs. A container whose
+## files are gone (a RAM disk after a reboot) never reports "stopped", so
+## any state other than running or extracting counts.
 :local stopContainer do={
     :global AghState
     :do { /container stop [find where name=$containerName] } on-error={ }
-    :local state ""
+    :local state "running"
     :local waited 0
-    :while ($state != "stopped" && $state != "missing" && $waited < [:tonum $timeout]) do={
+    :while (($state = "running" || $state = "extracting") && $waited < [:tonum $timeout]) do={
         :delay 2s
         :set waited ($waited + 2)
         :set state [$AghState containerName=$containerName]
     }
-    :return ($state = "stopped" || $state = "missing")
+    :return ($state != "running" && $state != "extracting")
 }
 
 ## Returns true once the server answers a DNS query (one try if timeout=0).
@@ -718,8 +720,25 @@
         }
     }
     :if ([:len $saved] > 0) do={
-        :set serversUseContainer true
-        :put ("      |-- [INFO] Recovering DNS settings from an interrupted run: " . $dnsOriginalServers)
+        :put ("      |-- [INFO] Recovering DNS settings saved by an earlier run: " . $dnsOriginalServers)
+        ## The loader also saves settings when the router could not resolve at
+        ## all (for example right after a reboot). If they never pointed at
+        ## the container, restore them now instead of waiting for it.
+        :foreach s in=[$splitList value=$dnsOriginalServers] do={
+            :if ($s = $containerIp) do={ :set serversUseContainer true }
+        }
+        :if ([:typeof [:find $dnsOriginalDoh ("//" . $containerIp . "/")]] = "num" || \
+            [:typeof [:find $dnsOriginalDoh ("//" . $containerIp . ":")]] = "num") do={
+            :set serversUseContainer true
+        }
+        :if ($serversUseContainer = false) do={
+            /ip dns set servers=$dnsOriginalServers
+            :if ($dnsDohUsesContainer = true) do={ /ip dns set use-doh-server=$dnsOriginalDoh }
+            /ip dns cache flush
+            :do { /system script remove [find where name=$cRestoreScript] } on-error={ }
+            :set dnsDohUsesContainer false
+            :put "      |-- [OK] Restored them; they do not depend on the container"
+        }
     } else={
         :foreach s in=$currentServers do={
             :if ([:len $dnsOriginalServers] > 0) do={ :set dnsOriginalServers ($dnsOriginalServers . ",") }
