@@ -61,7 +61,7 @@
 ## Short updater saved after a successful run ("" disables):
 ##   /system script run dns-filter
 :local cUpdaterName "dns-filter"
-:local cScriptUrl "https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/main/adguardhome_script.rsc"
+:local cScriptUrl "https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/agent/safe-upgrade-pihole/adguardhome_script.rsc"
 :local cTmpDir ($cDefaultStorageMount . "/tmp")
 
 ## Fallback resolvers used while the router's DNS server is switching
@@ -174,14 +174,30 @@
     :return $state
 }
 
-## Returns a container's container-size as a string, or "".
-:local containerSize do={
-    :local size ""
-    :local items [/container print as-value where name=$containerName]
-    :if ([:len $items] > 0) do={
-        :foreach k,v in=($items->0) do={ :if ($k = "container-size") do={ :set size [:tostr $v] } }
+## Returns the Docker Hub digest the image tag points to, or "" if it cannot
+## be read. Used to skip the download when nothing changed.
+:local remoteDigest do={
+    :local img [:tostr $image]
+    :local tag "latest"
+    :local colon [:find $img ":"]
+    :if ([:typeof $colon] = "num") do={
+        :set tag [:pick $img ($colon + 1) [:len $img]]
+        :set img [:pick $img 0 $colon]
     }
-    :return $size
+    :if ([:typeof [:find $img "/"]] != "num") do={ :set img ("library/" . $img) }
+    :local digest ""
+    :do {
+        :local auth ([/tool fetch output=user as-value url=("https://auth.docker.io/token?service=" . \
+            "registry.docker.io&scope=repository:" . $img . ":pull")]->"data")
+        :local t1 ([:find $auth "\"token\":\""] + 9)
+        :local token [:pick $auth $t1 [:find $auth "\"" $t1]]
+        :local body ([/tool fetch output=user as-value url=("https://registry-1.docker.io/v2/" . \
+            $img . "/manifests/" . $tag) http-header-field=("Authorization: Bearer " . $token . \
+            ",Accept: application/vnd.oci.image.index.v1+json")]->"data")
+        :local d1 [:find $body "sha256:"]
+        :if ([:typeof $d1] = "num") do={ :set digest [:pick $body $d1 ($d1 + 71)] }
+    } on-error={ }
+    :return $digest
 }
 
 ## Waits until a new container finishes extracting. Returns the final state.
@@ -936,67 +952,68 @@
         }
     }
 
-    :local bootFlag "no"
-    :if ([:len $oldName] = 0) do={ :set bootFlag "yes" }
-    :if ([:len $oldName] > 0) do={
-        :put ("      |-- Pulling into '" . $newName . "'; '" . $oldName . "' keeps serving DNS")
-    } else={
-        :put ("      |-- Pulling into '" . $newName . "'")
-    }
-    :do {
-        :if ($appId = "adguard") do={
-            /container add remote-image=$appImage check-certificate=yes name=$newName \
-                interface=$cInterface logging=yes mountlists=$appMountList start-on-boot=$bootFlag \
-                root-dir=$newRoot workdir="/opt/adguardhome/work" envlist=$appEnvList \
-                cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
-                entrypoint=/opt/adguardhome/AdGuardHome
-        } else={
-            /container add remote-image=$appImage check-certificate=yes name=$newName \
-                interface=$cInterface logging=yes mountlists=$appMountList start-on-boot=$bootFlag \
-                root-dir=$newRoot envlist=$appEnvList
-        }
-    } on-error={
-        :put "      |   |-- [FAILED] RouterOS rejected the container (disk space? /container log)"
-        :set failReason "Container creation rejected"
-        :error $failReason
-    }
-
-    :local pullState [$waitForExtraction containerName=$newName timeout=$cPullTimeout \
-        poll=$cPollSeconds progress=$cProgressSeconds]
-    :if ($pullState != "stopped" && $pullState != "running") do={
-        :put ("      |   |-- [FAILED] Image pull ended in state: " . $pullState)
-        $printContainerDetails containerName=$newName
-        :do { /container remove [find where name=$newName] } on-error={ }
-        :if ([:len $oldName] > 0) do={
-            :put ("      |   |-- '" . $oldName . "' was not touched and keeps running")
-        }
-        :set failReason ("Image pull failed (" . $pullState . "); increase cPullTimeout if slow")
-        :error $failReason
-    }
-    :put "      |   |-- [OK] Image extracted"
-
-    ## Same app: skip the switch when the pulled image matches the one
+    ## Same app: skip the download when the registry digest matches the one
     ## recorded at the last successful run (in the updater's comment).
+    :local remote ""
     :local upToDate false
-    :local newSize [$containerSize containerName=$newName]
     :if ([:len $liveName] > 0 && $switchingApps = false && $envChanged = false && \
-        $workMountAdded = false && [:len $newSize] > 0 && [:len $cUpdaterName] > 0) do={
+        $workMountAdded = false && [:len $cUpdaterName] > 0) do={
+        :set remote [$remoteDigest image=$appImage]
         :local updaterIds [/system script find where name=$cUpdaterName]
-        :if ([:len $updaterIds] > 0) do={
-            :set upToDate ([/system script get ($updaterIds->0) comment] = ($appId . " image " . $newSize))
+        :if ([:len $remote] > 0 && [:len $updaterIds] > 0) do={
+            :set upToDate ([/system script get ($updaterIds->0) comment] = ($appId . " " . $remote))
         }
+        ## A live container that is not running is replaced even if current.
         :if ($upToDate = true && [$DnsFilterState containerName=$liveName] != "running") do={
-            ## A stopped live container is replaced even if the image is the same.
             :set upToDate false
         }
+    } else={
+        :set remote [$remoteDigest image=$appImage]
     }
 
     :if ($upToDate = true) do={
-        :set deployedImage ($appId . " image " . $newSize)
-        /container remove [find where name=$newName]
-        :put ("      |-- [OK] Already up to date; '" . $liveName . "' was not restarted")
+        :set deployedImage ($appId . " " . $remote)
+        :put ("      |-- [OK] Already up to date; nothing downloaded, '" . $liveName . "' not restarted")
         :set resultText "UP TO DATE"
     } else={
+        :local bootFlag "no"
+        :if ([:len $oldName] = 0) do={ :set bootFlag "yes" }
+        :if ([:len $oldName] > 0) do={
+            :put ("      |-- Pulling into '" . $newName . "'; '" . $oldName . "' keeps serving DNS")
+        } else={
+            :put ("      |-- Pulling into '" . $newName . "'")
+        }
+        :do {
+            :if ($appId = "adguard") do={
+                /container add remote-image=$appImage check-certificate=yes name=$newName \
+                    interface=$cInterface logging=yes mountlists=$appMountList start-on-boot=$bootFlag \
+                    root-dir=$newRoot workdir="/opt/adguardhome/work" envlist=$appEnvList \
+                    cmd="-c /opt/adguardhome/conf/AdGuardHome.yaml -h 0.0.0.0 -w /opt/adguardhome/work" \
+                    entrypoint=/opt/adguardhome/AdGuardHome
+            } else={
+                /container add remote-image=$appImage check-certificate=yes name=$newName \
+                    interface=$cInterface logging=yes mountlists=$appMountList start-on-boot=$bootFlag \
+                    root-dir=$newRoot envlist=$appEnvList
+            }
+        } on-error={
+            :put "      |   |-- [FAILED] RouterOS rejected the container (disk space? /container log)"
+            :set failReason "Container creation rejected"
+            :error $failReason
+        }
+
+        :local pullState [$waitForExtraction containerName=$newName timeout=$cPullTimeout \
+            poll=$cPollSeconds progress=$cProgressSeconds]
+        :if ($pullState != "stopped" && $pullState != "running") do={
+            :put ("      |   |-- [FAILED] Image pull ended in state: " . $pullState)
+            $printContainerDetails containerName=$newName
+            :do { /container remove [find where name=$newName] } on-error={ }
+            :if ([:len $oldName] > 0) do={
+                :put ("      |   |-- '" . $oldName . "' was not touched and keeps running")
+            }
+            :set failReason ("Image pull failed (" . $pullState . "); increase cPullTimeout if slow")
+            :error $failReason
+        }
+        :put "      |   |-- [OK] Image extracted"
         :if ($healthcheckSupported = true) do={
             :set healthcheckConfigured [$applyHealthcheck command=("/container set [find name=\"" . \
                 $newName . "\"] healthcheck-cmd=\"" . $appHealthcheckCmd . "\" healthcheck-interval=" . \
@@ -1014,7 +1031,8 @@
         :local configBackup ""
         :local confFile ([$filePath path=$appConfSrc] . "/" . $appConfigFile)
         :local hasConfig ([:len [/file find where name=$confFile]] > 0 || \
-            [:len [/file find where name=("/" . $confFile)]] > 0)
+            [:len [/file find where name=("/" . $confFile)]] > 0 || \
+            [:len [/file find where name~("/" . $appConfigFile . "\$")]] > 0)
         :if ([:len $oldName] > 0) do={
             :if ([$DnsFilterState containerName=$oldName] = "running") do={
                 :set oldAnswered [$dnsAnswers host=$cDnsTestHost server=$containerIp timeout=15]
@@ -1138,7 +1156,7 @@
 
         ## Success: make the new container permanent.
         :set servingName $newName
-        :if ([:len $newSize] > 0) do={ :set deployedImage ($appId . " image " . $newSize) }
+        :if ([:len $remote] > 0) do={ :set deployedImage ($appId . " " . $remote) }
         :do { /container set [find where name=$newName] start-on-boot=yes } on-error={ }
         :if ([:len $oldName] > 0) do={
             :if ($switchingApps = true) do={
