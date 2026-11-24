@@ -3,7 +3,8 @@
 # ============================================================================
 # Version: 2.2.0
 # Install and run (RouterOS terminal):
-#   :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
+#   /tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=file dst-path=mikrotik-adguardhome.rsc
+#   /import file-name=mikrotik-adguardhome.rsc
 # Afterwards:
 #   /system script run mikrotik-adguardhome
 #
