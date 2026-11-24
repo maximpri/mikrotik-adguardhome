@@ -4,25 +4,23 @@ A RouterOS script that installs, upgrades, or switches between [AdGuard Home](ht
 
 ## Quick start
 
-Paste this into the RouterOS terminal:
+Download the loader in the RouterOS terminal:
 
 ```routeros
-:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
+/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=file dst-path=mikrotik-adguardhome.rsc
 ```
 
-It sets up two RouterOS scripts, `mikrotik-adguardhome` and `mikrotik-adguardhome-settings`, then installs AdGuard Home, or upgrades whichever app is already installed. From then on, the whole command is:
+Wait for `status: finished`. To install **Pi-hole**, run `:global AghApp "pihole"` in the same terminal session before importing. Otherwise, the loader installs AdGuard Home or upgrades whichever app is already installed.
+
+```routeros
+/import file-name=mikrotik-adguardhome.rsc
+```
+
+After a successful import, remove the downloaded file with `/file remove mikrotik-adguardhome.rsc`. The loader sets up two scripts, `mikrotik-adguardhome` and `mikrotik-adguardhome-settings`. You can change `app` in the settings script later. To rerun the loader, use:
 
 ```routeros
 /system script run mikrotik-adguardhome
 ```
-
-For **Pi-hole**, put `:global AghApp "pihole"; ` in front of the line, or set `app` in the settings script later:
-
-```routeros
-:global AghApp "pihole"; :local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
-```
-
-When pasting, check that the line starts with `:` and ends with `$s`. Some terminals insert stray characters such as `v` or `c` from the paste shortcut; RouterOS then reports `syntax error`, or does nothing.
 
 See [Installing the bootstrap script](#installing-the-bootstrap-script) for other ways to install it, and for how to check, reset, or remove it.
 
@@ -55,23 +53,13 @@ The bootstrap (loader) script is the only part that lives on the router permanen
 
 Installing it also runs a deployment right away, so the first run installs or upgrades the app. Use any one of these methods.
 
-**Terminal (recommended).** Paste the line from [Quick start](#quick-start).
+**Terminal (recommended).** Download and import the loader using the commands in [Quick start](#quick-start).
 
-**Winbox or WebFig, without pasting into the terminal.** Open **System → Scripts**, add a script named `mikrotik-adguardhome`, and put this in **Source**:
+**Winbox or WebFig, using System → Scripts.** Download [the loader](https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc) to your computer and copy its contents. Open **System → Scripts**, add a script named `mikrotik-adguardhome`, and paste the contents into **Source**.
 
-```routeros
-:local s [:parse ([/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc" output=user as-value]->"data")]; $s
-```
+Then click **Run Script**. The first run replaces the source with the update stub and creates the settings script.
 
-Then click **Run Script**. The first run replaces this line with the full stub, gives the script full permissions, and creates the settings script.
-
-**File import.** Download the loader and import it:
-
-```routeros
-/tool fetch url="https://raw.githubusercontent.com/maximpri/mikrotik-adguardhome/latest/mikrotik-adguardhome.rsc"
-/import mikrotik-adguardhome.rsc
-/file remove mikrotik-adguardhome.rsc
-```
+**File upload.** If the router cannot download the loader, download it to your computer, upload it through **Files**, and run `/import file-name=mikrotik-adguardhome.rsc`. The router still needs GitHub access to download the deployment script.
 
 **Check the installation:**
 
@@ -269,7 +257,7 @@ On 7.22, the script relies on its own running, stability, and DNS checks.
 
 ## Upgrading from earlier versions
 
-Run the install line from [Quick start](#quick-start) once. It replaces the old updater scripts with the loader. Existing AdGuard Home deployments are upgraded in place. The first run pulls into `adguardhome-next` at `/usb1/agh-next`, switches, removes the old container, and renames the new one to `adguardhome`. Later upgrades alternate between `/usb1/agh` and `/usb1/agh-next`.
+Follow [Quick start](#quick-start) once. It replaces the old updater scripts with the loader. Existing AdGuard Home deployments are upgraded in place. The first run pulls into `adguardhome-next` at `/usb1/agh-next`, switches, removes the old container, and renames the new one to `adguardhome`. Later upgrades alternate between `/usb1/agh` and `/usb1/agh-next`.
 
 Deployments from before 1.7.0 keep AdGuard Home's work data (statistics, query log, cached filter lists, login sessions) inside the container. The upgrade replaces the container, so the script stops and asks first. To move work data to `/usb1/work/agh`, and start statistics and the query log empty, run:
 
@@ -288,7 +276,7 @@ Then run the script again. Settings, users, rules, and filter lists in `AdGuardH
 /log print where message~"mikrotik-adguardhome"
 ```
 
-- **`syntax error`, or the line does nothing:** check that the pasted line starts with `:` and ends with `$s`, with no stray characters.
+- **Import error:** check the exact error from `/import`. If it reports a syntax error, run `/import file-name=mikrotik-adguardhome.rsc verbose=yes dry-run` to check the downloaded loader without applying it. Include the error and the output of `:put [/system resource get version]` when reporting the problem.
 - **A fetch error:** check router DNS and internet access with `:put [:resolve raw.githubusercontent.com]`. If certificate validation fails because of the CRL, add `check-certificate=yes-without-crl` to the fetch command.
 - **`[INFO] Using 'latest'`:** normal on RouterOS, which GitHub's API doesn't answer. A version published in the last few minutes may not be served yet.
 - **`Router DNS: fallback active` in the summary:** the container is not answering yet. Run the script again once it answers, or run `/system script run mikrotik-adguardhome-restore`.
